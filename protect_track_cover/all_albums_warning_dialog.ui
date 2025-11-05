@@ -47,7 +47,7 @@
        </property>
       </widget>
      </item>
-     <item>
+     <item alignment="Qt::AlignHCenter">
       <widget class="QLabel" name="headerLabel">
        <property name="text">
         <string>Albums with differing embedded covers</string>
@@ -56,7 +56,7 @@
         <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
        </property>
        <property name="wordWrap">
-        <bool>true</bool>
+        <bool>false</bool>
        </property>
       </widget>
      </item>
