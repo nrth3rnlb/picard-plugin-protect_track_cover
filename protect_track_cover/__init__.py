@@ -52,14 +52,16 @@ from mutagen.oggvorbis import OggVorbis
 from picard.ui.options import register_options_page
 from picard import log
 
-from picard.file import register_file_post_load_processor, register_file_post_save_processor
+from picard.file import register_file_post_load_processor, register_file_post_save_processor, \
+    register_file_post_addition_to_track_processor
 from picard.album import register_album_post_removal_processor
 
-file_list = {}
+file_list: Dict[str, Dict[str, Any]] = {}  # album_id -> {'files': [paths], 'name': album_name}
+# global aggregated state: value contains mapping + album name
+all_album_mappings: Dict[str, Dict[str, Any]] = {}  # album_id -> {'mapping': {cover_hash: [paths]}, 'name': album_name}
 
-# global aggregated state
-all_album_mappings: Dict[str, Dict] = {}  # album_id -> mapping (cover_hash -> [paths])
 all_albums_dialog: Optional[AllAlbumsWarningDialog] = None
+# global aggregated state
 all_dialog_closed: bool = False
 
 from typing import Set
@@ -235,14 +237,14 @@ class AllAlbumsWarningDialog(QDialog, Ui_AllAlbumsWarningDialog):
         self.close()
 
 
-def _format_album_block(album_id: str, mapping: Dict) -> str:
+def _format_album_block(album_id: str, mapping: Dict, album_name: Optional[str] = None) -> str:
     """
     Create an HTML block for a single album showing grouped tracks.
-    We avoid showing checksums. Groups are labelled 'Cover group N', 'No embedded cover',
-    and 'Read errors'.
+    album_name (if provided) will be shown instead of album_id.
     """
     parts = []
-    parts.append(f"<h3>Album: {album_id}</h3>")
+    album_label = album_name or album_id
+    parts.append(f"<h3>{album_label}</h3>")
     # Filter and sort groups: display 'no cover' and 'error' last/first
     normal_groups = [(h, paths) for h, paths in mapping.items() if h not in (None, "error")]
     no_cover = mapping.get(None, [])
@@ -278,29 +280,33 @@ def _format_album_block(album_id: str, mapping: Dict) -> str:
 
 
 def format_aggregated_report(all_mappings: Dict[str, Dict]) -> str:
-    """Build full HTML report for all albums that currently have differing covers."""
+    """Build full HTML report for all albums that currently have differing covers.
+    Accepts values in the shape {'mapping': {...}, 'name': '...'} for each album_id.
+    """
     parts = []
     parts.append("<html><body>")
     any_shown = False
-    for album_id, mapping in all_mappings.items():
-        # determine if album has differing covers according to previous logic
+    for album_id, entry in all_mappings.items():
+        # support both old and new shapes (entry may be mapping directly)
+        mapping = entry.get("mapping") if isinstance(entry, dict) and "mapping" in entry else entry
+        album_name = entry.get("name") if isinstance(entry, dict) else None
+
         real_hashes = [k for k in mapping.keys() if k not in (None, "error")]
         distinct = set(real_hashes)
         different_covers = len(distinct) > 1 or (len(distinct) == 1 and None in mapping)
         if different_covers:
             any_shown = True
-            parts.append(_format_album_block(album_id, mapping))
+            parts.append(_format_album_block(album_id, mapping, album_name))
     if not any_shown:
         parts.append("<p><em>No albums with differing embedded covers at the moment.</em></p>")
     parts.append("</body></html>")
     return "\n".join(parts)
 
-
-def warn_if_multiple_covers(mapping, parent_widget=None, album_id: Optional[str] = None):
+def warn_if_multiple_covers(mapping, parent_widget=None, album_id: Optional[str] = None, album_name: Optional[str] = None):
     """
     Non-blocking aggregated warning for all albums.
-    - Updates internal per-album mapping.
-    - Maintains a single dialog for all albums; dismissal is recorded per-album so new albums will still trigger the dialog.
+    - Updates internal per-album mapping and stored album name.
+    - Maintains a single dialog for all albums
     """
     global all_albums_dialog, all_album_mappings, album_dialog_closed
 
@@ -309,17 +315,18 @@ def warn_if_multiple_covers(mapping, parent_widget=None, album_id: Optional[str]
     distinct = set(real_hashes)
     different_covers = len(distinct) > 1 or (len(distinct) == 1 and None in mapping)
 
-    # update aggregated state for this album_id
+    # update aggregated state for this album_id (store mapping + name)
     if album_id:
         if not different_covers:
             all_album_mappings.pop(album_id, None)
         else:
-            all_album_mappings[album_id] = {k: list(v) for k, v in mapping.items()}
+            all_album_mappings[album_id] = {'mapping': {k: list(v) for k, v in mapping.items()},
+                                           'name': album_name}
 
     # Build filtered report only for albums that have differing covers and are not dismissed
-    # Collect album ids that should be shown
     albums_to_show = []
-    for aid, m in all_album_mappings.items():
+    for aid, entry in all_album_mappings.items():
+        m = entry.get('mapping') if isinstance(entry, dict) and 'mapping' in entry else entry
         real_hashes = [k for k in m.keys() if k not in (None, "error")]
         distinct = set(real_hashes)
         diff = len(distinct) > 1 or (len(distinct) == 1 and None in m)
@@ -369,17 +376,16 @@ def warn_if_multiple_covers(mapping, parent_widget=None, album_id: Optional[str]
 
     return True
 
-def protect_track_cover(file: Any):
+
+def protect_track_cover(track, file: Any):
     try:
         log.debug("%s: Processing file: %s", PLUGIN_NAME, getattr(file, "filename", "<unknown>"))
 
-        album_id = None
-        try:
-            album_id = file.metadata.get(MUSICBRAINZ_ALBUMID)
-        except Exception:
-            # some Picard versions may provide metadata differently
-            pass
+        if not file.metadata.get(MUSICBRAINZ_ALBUMID):
+            log.debug("%s: Skipping for track in %s as %s is required.", PLUGIN_NAME, track.album, MUSICBRAINZ_ALBUMID)
+            return
 
+        album_id = file.metadata.get(MUSICBRAINZ_ALBUMID)
         # normalise if Picard gives a list/tuple
         if isinstance(album_id, (list, tuple)):
             album_id = album_id[0] if album_id else None
@@ -387,22 +393,27 @@ def protect_track_cover(file: Any):
         if not album_id:
             return
 
-        # track files per album and avoid duplicates
-        file_list.setdefault(album_id, [])
-        if getattr(file, "filename", None) and file.filename not in file_list[album_id]:
-            file_list[album_id].append(file.filename)
+        album = track.album.metadata.get("album") or "<unknown>"
+
+        # track files per album and avoid duplicates; store album name too
+        file_list.setdefault(album_id, {"files": [], "name": album})
+        if album and not file_list[album_id].get("name"):
+            file_list[album_id]["name"] = album
+
+        if getattr(file, "filename", None) and file.filename not in file_list[album_id]["files"]:
+            file_list[album_id]["files"].append(file.filename)
 
         # scan embedded covers for the tracked files of this album
-        mapping = scan_files_for_embedded_covers(file_list[album_id])
+        mapping = scan_files_for_embedded_covers(file_list[album_id]["files"])
 
         report = format_scan_report(mapping)
         log.info("%s: Scan result for album %s:\n%s", PLUGIN_NAME, album_id, report)
         for h, paths in mapping.items():
             log.debug("%s: cover=%s files=%s", PLUGIN_NAME, h, ", ".join(os.path.basename(p) for p in paths))
 
-        # non-blocking warning/update dialog per album
+        # non-blocking warning/update dialog per album (pass album_name)
         try:
-            warn_if_multiple_covers(mapping, album_id=album_id)
+            warn_if_multiple_covers(mapping, album_id=album_id, album_name=file_list[album_id].get("name"))
         except Exception:
             log.error("%s: Error showing/updating warning dialog for album %s: %s", PLUGIN_NAME, album_id, _traceback.format_exc())
 
@@ -410,69 +421,70 @@ def protect_track_cover(file: Any):
         log.error("%s: Error in protect_track_cover: %s", PLUGIN_NAME, e)
         log.error("%s: Traceback: %s", PLUGIN_NAME, _traceback.format_exc())
 
-def on_album_removed(album: Any):
-    """
-    Cleanup internal state for an album when Picard removes it.
-    Called via register_album_post_removal_processor(...).
-    """
-    try:
-        # determine album id robustly
-        album_id = None
-        try:
-            album_metadata = getattr(album, "metadata", None)
-            if isinstance(album_metadata, dict):
-                album_id = album_metadata.get(MUSICBRAINZ_ALBUMID)
-        except Exception:
-            pass
-        if not album_id:
-            album_id = getattr(album, "albumid", None) or getattr(album, "id", None)
-        if isinstance(album_id, (list, tuple)):
-            album_id = album_id[0] if album_id else None
-        if not album_id:
-            return
 
-        # remove tracked state for this album
-        all_album_mappings.pop(album_id, None)
-        file_list.pop(album_id, None)
-        album_dialog_closed.discard(album_id)
-        try:
-            album_dismissed_signature.pop(album_id, None)
-        except Exception:
-            pass
-
-        # Update or close the aggregated dialog depending on remaining albums to show
-        try:
-            # compute remaining albums that still need warnings and are not dismissed
-            albums_to_show = []
-            for aid, m in all_album_mappings.items():
-                real_hashes = [k for k in m.keys() if k not in (None, "error")]
-                distinct = set(real_hashes)
-                diff = len(distinct) > 1 or (len(distinct) == 1 and None in m)
-                if diff and aid not in album_dialog_closed:
-                    albums_to_show.append(aid)
-
-            if not albums_to_show:
-                if all_albums_dialog is not None:
-                    try:
-                        all_albums_dialog.close()
-                    except Exception:
-                        pass
-                    globals().update({'all_albums_dialog': None})
-            else:
-                # refresh dialog contents for remaining albums
-                filtered = {aid: all_album_mappings[aid] for aid in albums_to_show}
-                if all_albums_dialog is not None:
-                    try:
-                        all_albums_dialog.update_html(format_aggregated_report(filtered))
-                    except Exception:
-                        pass
-        except Exception:
-            log.error("%s: Error updating dialog after album removal: %s", PLUGIN_NAME, _traceback.format_exc())
-
-    except Exception:
-        log.error("%s: Error in on_album_removed: %s", PLUGIN_NAME, _traceback.format_exc())
-
+# def on_album_removed(album: Any):
+#     """
+#     Cleanup internal state for an album when Picard removes it.
+#     Called via register_album_post_removal_processor(...).
+#     """
+#     try:
+#         # determine album id robustly
+#         album_id = None
+#         try:
+#             album_metadata = getattr(album, "metadata", None)
+#             if isinstance(album_metadata, dict):
+#                 album_id = album_metadata.get(MUSICBRAINZ_ALBUMID)
+#         except Exception:
+#             pass
+#         if not album_id:
+#             album_id = getattr(album, "albumid", None) or getattr(album, "id", None)
+#         if isinstance(album_id, (list, tuple)):
+#             album_id = album_id[0] if album_id else None
+#         if not album_id:
+#             return
+#
+#         # remove tracked state for this album
+#         all_album_mappings.pop(album_id, None)
+#         file_list.pop(album_id, None)
+#         album_dialog_closed.discard(album_id)
+#         try:
+#             album_dismissed_signature.pop(album_id, None)
+#         except Exception:
+#             pass
+#
+#         # Update or close the aggregated dialog depending on remaining albums to show
+#         try:
+#             # compute remaining albums that still need warnings and are not dismissed
+#             albums_to_show = []
+#             for aid, entry in all_album_mappings.items():
+#                 m = entry.get('mapping') if isinstance(entry, dict) and 'mapping' in entry else entry
+#                 real_hashes = [k for k in m.keys() if k not in (None, "error")]
+#                 distinct = set(real_hashes)
+#                 diff = len(distinct) > 1 or (len(distinct) == 1 and None in m)
+#                 if diff and aid not in album_dialog_closed:
+#                     albums_to_show.append(aid)
+#
+#             if not albums_to_show:
+#                 if all_albums_dialog is not None:
+#                     try:
+#                         all_albums_dialog.close()
+#                     except Exception:
+#                         pass
+#                     globals().update({'all_albums_dialog': None})
+#             else:
+#                 # refresh dialog contents for remaining albums
+#                 filtered = {aid: all_album_mappings[aid] for aid in albums_to_show}
+#                 if all_albums_dialog is not None:
+#                     try:
+#                         all_albums_dialog.update_html(format_aggregated_report(filtered))
+#                     except Exception:
+#                         pass
+#         except Exception:
+#             log.error("%s: Error updating dialog after album removal: %s", PLUGIN_NAME, _traceback.format_exc())
+#
+#     except Exception:
+#         log.error("%s: Error in on_album_removed: %s", PLUGIN_NAME, _traceback.format_exc())
 
 log.debug(PLUGIN_NAME + ": registration")
-register_file_post_load_processor(protect_track_cover)
-register_album_post_removal_processor(on_album_removed)
+register_file_post_addition_to_track_processor(protect_track_cover)
+# register_album_post_removal_processor(on_album_removed)
