@@ -1,0 +1,101 @@
+[project]
+name = "picard-plugin-protect_track_cover"
+version = "0.2.0"
+readme = "README.md"
+description = """
+Protect Track Cover Plugin for MusicBrainz Picard.
+Warns if the tracks on an album use different covers
+and there is a potential risk of these being replaced by the album cover.
+"""
+keywords = ["musicbrainz", "picard", "plugin", "cover", "music", "organization"]
+license = {file = "LICENSE"}
+authors = [
+    {name = "nrth3rnlb"}
+]
+requires-python = ">=3.8"
+dependencies = [
+    "PyQt5>=5.15.0",
+    "PyYAML>=6.0",
+    "fasteners~=0.14",
+    "Markdown~=3.2",
+    "mutagen~=1.37",
+    "PyJWT~=2.0",
+    "python-dateutil~=2.7",
+    "python_libdiscid~=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "pytest-mock>=3.12.0",
+    "mypy>=1.3.0",
+    "python-semantic-release>=7.23.3",
+]
+build = [
+    "commitizen>=2.32.2",
+    "pre-commit>=3.6",
+]
+
+[tool.setuptools.packages.find]
+include = ["protect_track_cover*"]
+exclude = ["tests*"]
+
+[tool.coverage.run]
+source = ["protect_track_cover"]
+omit = [
+    "*/tests/*",
+    "*/__pycache__/*",
+    "*/ui_*.py",
+    "*_ui.py"
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "@abstractmethod"
+]
+
+[tool.mypy]
+exclude = [
+    "ui_.*\\.py$",
+    ".*_ui\\.py$"
+]
+ignore_missing_imports = true
+warn_unused_ignores = false
+
+[tool.ruff]
+exclude = [
+    "ui_*.py",
+    "*_ui.py",
+    "__pycache__",
+    ".git",
+    ".venv",
+    "venv"
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]  # Line too long
+
+[tool.pylint.main]
+ignore-patterns = ["ui_.*\\.py", ".*_ui\\.py"]
+
+[tool.pdm.scripts]
+precommit-install = "pre-commit install -t commit-msg"
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+version = "0.2.0"
+tag_format = "v$version"
+update_changelog_on_bump = true
+gpg_sign = true
+version_files = [
+    "pyproject.toml:version",
+    "protect_track_cover/__init__.py:PLUGIN_VERSION"
+]
