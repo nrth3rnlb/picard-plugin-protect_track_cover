@@ -8,34 +8,31 @@ Warnt, wenn Tracks unterschiedliche Cover verwenden, und diese durch das Album C
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+import os
 
-import traceback
-from typing import Any, Dict
+from typing import Any
+
+from PyQt5 import uic
 
 PLUGIN_NAME = "Protect Track Cover"
 PLUGIN_AUTHOR = "nrth3rnlb"
 PLUGIN_DESCRIPTION = """
 Protect Track Cover Plugin for MusicBrainz Picard.
-Warnt, wenn Tracks unterschiedliche Cover verwenden, und diese durch das Album Cover ersetzt werden sollen
+
+Warns when tracks on an album use different covers and there is a
+potential danger that these will be replaced by the album cover.
 """
-PLUGIN_VERSION = __version__
-PLUGIN_API_VERSIONS = ["2.7", "2.8"]
+PLUGIN_VERSION = "0.1.0"
+PLUGIN_API_VERSIONS = ["2.0"]
 PLUGIN_LICENSE = "GPL-2.0"
 PLUGIN_LICENSE_URL = "https://www.gnu.org/licenses/gpl-2.0.html"
 
 MUSICBRAINZ_ALBUMID = "musicbrainz_albumid"
 
-import os
 import hashlib
 import base64
 import traceback as _traceback
 
-from PyQt5.QtWidgets import QMessageBox, QApplication
-from PyQt5.QtCore import Qt, pyqtSignal
-
-from PyQt5.QtWidgets import QDialog, QTextBrowser, QVBoxLayout, QPushButton, QHBoxLayout
-from PyQt5.QtCore import Qt
 from typing import Dict
 from PyQt5.QtWidgets import QApplication
 
@@ -43,24 +40,21 @@ from PyQt5.QtWidgets import QApplication
 from typing import Optional
 
 from mutagen import File
-from mutagen.id3 import ID3, APIC
+from mutagen.id3 import ID3
 from mutagen.flac import FLAC, Picture
-from mutagen.mp4 import MP4, MP4Cover
+from mutagen.mp4 import MP4
 from mutagen.mp3 import MP3
-from mutagen.oggvorbis import OggVorbis
 
-from picard.ui.options import register_options_page
 from picard import log
 
-from picard.file import register_file_post_load_processor, register_file_post_save_processor, \
-    register_file_post_addition_to_track_processor
+from picard.file import register_file_post_addition_to_track_processor
 from picard.album import register_album_post_removal_processor
 
 file_list: Dict[str, Dict[str, Any]] = {}  # album_id -> {'files': [paths], 'name': album_name}
 # global aggregated state: value contains mapping + album name
 all_album_mappings: Dict[str, Dict[str, Any]] = {}  # album_id -> {'mapping': {cover_hash: [paths]}, 'name': album_name}
 
-all_albums_dialog: Optional[AllAlbumsWarningDialog] = None
+all_albums_dialog: Optional[AlbumsWarningDialog] = None
 # global aggregated state
 all_dialog_closed: bool = False
 
@@ -181,17 +175,18 @@ def format_scan_report(mapping):
     return "\n".join(parts)
 
 
+
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import QDialog, QStyle
 
-from .ui_all_albums_warning_dialog import Ui_AllAlbumsWarningDialog
-
-
-class AllAlbumsWarningDialog(QDialog, Ui_AllAlbumsWarningDialog):
+class AlbumsWarningDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setupUi(self)
+
+        ui_file = os.path.join(os.path.dirname(__file__), 'albums_warning.ui')
+        uic.loadUi(ui_file, self)
+
         self.setModal(False)
         self.setAttribute(Qt.WA_DeleteOnClose, True)
         self.closeButton.clicked.connect(self._on_close_clicked)
@@ -211,8 +206,10 @@ class AllAlbumsWarningDialog(QDialog, Ui_AllAlbumsWarningDialog):
         self.iconLabel.setPixmap(pixmap)
         self.iconLabel.setScaledContents(False)
 
-    def update_html(self, html: str):
+    def update_html(self, html: str = "", html_no_cover: str = "", html_errors: str = ""):
         self.browser.setHtml(html)
+        self.browser_no_cover.setHtml(html_no_cover)
+        self.browser_errors.setHtml(html_errors)
         try:
             self.show()
             self.raise_()
@@ -223,26 +220,15 @@ class AllAlbumsWarningDialog(QDialog, Ui_AllAlbumsWarningDialog):
     def _on_close_clicked(self):
         self.close()
 
-    def update_html(self, html: str):
-        self.browser.setHtml(html)
-        try:
-            self.show()
-            self.raise_()
-            self.activateWindow()
-        except Exception:
-            pass
-
-    def _on_close_clicked(self):
-        # record dismissed albums here, then close
-        self.close()
-
-
-def _format_album_block(album_id: str, mapping: Dict, album_name: Optional[str] = None) -> str:
+def _format_album_block(album_id: str, mapping: Dict, album_name: Optional[str] = None) -> tuple[str, str, str]:
     """
-    Create an HTML block for a single album showing grouped tracks.
-    album_name (if provided) will be shown instead of album_id.
+    Create three HTML blocks for a single album showing grouped tracks.
+    Returns tuple of (main_html, no_cover_html, errors_html)
     """
     parts = []
+    parts_no_cover = []
+    parts_errors = []
+
     album_label = album_name or album_id
     parts.append(f"<h3>{album_label}</h3>")
     # Filter and sort groups: display 'no cover' and 'error' last/first
@@ -263,28 +249,28 @@ def _format_album_block(album_id: str, mapping: Dict, album_name: Optional[str] 
         parts.append("</ul>")
 
     if no_cover:
-        parts.append(f"<b>No embedded cover — {len(no_cover)} file(s):</b>")
-        parts.append("<ul>")
+        parts_no_cover.append(f"<b>No embedded cover — {len(no_cover)} file(s):</b>")
+        parts_no_cover.append("<ul>")
         for p in no_cover:
-            parts.append(f"<li>{os.path.basename(p)}</li>")
-        parts.append("</ul>")
+            parts_no_cover.append(f"<li>{os.path.basename(p)}</li>")
+        parts_no_cover.append("</ul>")
 
     if errors:
-        parts.append(f"<b>Read errors — {len(errors)} file(s):</b>")
-        parts.append("<ul>")
+        parts_errors.append(f"<b>Read errors — {len(errors)} file(s):</b>")
+        parts_errors.append("<ul>")
         for p in errors:
-            parts.append(f"<li>{os.path.basename(p)}</li>")
-        parts.append("</ul>")
+            parts_errors.append(f"<li>{os.path.basename(p)}</li>")
+        parts_errors.append("</ul>")
 
-    return "\n".join(parts)
+    return "\n".join(parts), "\n".join(parts_no_cover), "\n".join(parts_errors)
 
-
-def format_aggregated_report(all_mappings: Dict[str, Dict]) -> str:
+def format_aggregated_report(all_mappings: Dict[str, Dict]) -> tuple[str, str, str]:
     """Build full HTML report for all albums that currently have differing covers.
     Accepts values in the shape {'mapping': {...}, 'name': '...'} for each album_id.
     """
-    parts = []
-    parts.append("<html><body>")
+    parts: list[str] = ["<html><body>"]
+    parts_no_cover: list[str] = ["<html><body>"]
+    parts_errors: list[str] = ["<html><body>"]
     any_shown = False
     for album_id, entry in all_mappings.items():
         # support both old and new shapes (entry may be mapping directly)
@@ -296,11 +282,27 @@ def format_aggregated_report(all_mappings: Dict[str, Dict]) -> str:
         different_covers = len(distinct) > 1 or (len(distinct) == 1 and None in mapping)
         if different_covers:
             any_shown = True
-            parts.append(_format_album_block(album_id, mapping, album_name))
+            part, no_cover, errors = _format_album_block(album_id, mapping, album_name)
+            if part:
+                parts.append(part)
+            if no_cover:
+                parts_no_cover.append(no_cover)
+            if errors:
+                parts_errors.append(errors)
+
     if not any_shown:
         parts.append("<p><em>No albums with differing embedded covers at the moment.</em></p>")
     parts.append("</body></html>")
-    return "\n".join(parts)
+
+    if not parts_no_cover or len(parts_no_cover) == 1:
+        parts_no_cover.append("<p><em>No albums with files lacking embedded covers at the moment.</em></p>")
+    parts_no_cover.append("</body></html>")
+
+    if not parts_errors or len(parts_errors) == 1:
+        parts_errors.append("<p><em>No albums with file read errors at the moment.</em></p>")
+    parts_errors.append("</body></html>")
+
+    return "\n".join(parts), "\n".join(parts_no_cover), "\n".join(parts_errors)
 
 def warn_if_multiple_covers(mapping, parent_widget=None, album_id: Optional[str] = None, album_name: Optional[str] = None):
     """
@@ -324,14 +326,7 @@ def warn_if_multiple_covers(mapping, parent_widget=None, album_id: Optional[str]
                                            'name': album_name}
 
     # Build filtered report only for albums that have differing covers and are not dismissed
-    albums_to_show = []
-    for aid, entry in all_album_mappings.items():
-        m = entry.get('mapping') if isinstance(entry, dict) and 'mapping' in entry else entry
-        real_hashes = [k for k in m.keys() if k not in (None, "error")]
-        distinct = set(real_hashes)
-        diff = len(distinct) > 1 or (len(distinct) == 1 and None in m)
-        if diff and aid not in album_dialog_closed:
-            albums_to_show.append(aid)
+    albums_to_show = get_albums_to_show(album_dialog_closed, all_album_mappings)
 
     # If nothing remaining to show, close existing dialog if present and return
     if not albums_to_show:
@@ -347,8 +342,8 @@ def warn_if_multiple_covers(mapping, parent_widget=None, album_id: Optional[str]
         return True
 
     # Build aggregated HTML only for albums_to_show
-    filtered_mappings = {aid: all_album_mappings[aid] for aid in albums_to_show}
-    report_html = format_aggregated_report(filtered_mappings)
+    filtered = {aid: all_album_mappings[aid] for aid in albums_to_show}
+    report_html, report_no_cover_html, report_errors_html = format_aggregated_report(filtered)
 
     app = QApplication.instance()
     created_app = False
@@ -358,13 +353,13 @@ def warn_if_multiple_covers(mapping, parent_widget=None, album_id: Optional[str]
 
     try:
         if all_albums_dialog is None:
-            all_albums_dialog = AllAlbumsWarningDialog(parent_widget)
+            all_albums_dialog = AlbumsWarningDialog(parent_widget)
             # ensure deletion from variable when window is destroyed
             try:
                 all_albums_dialog.destroyed.connect(lambda _: globals().update({'all_albums_dialog': None}))
             except Exception:
                 pass
-        all_albums_dialog.update_html(report_html)
+        all_albums_dialog.update_html(report_html, report_no_cover_html, report_errors_html)
     except Exception as e:
         log.error("%s: Failed updating/creating aggregated dialog: %s", PLUGIN_NAME, e)
         log.error("%s: Traceback: %s", PLUGIN_NAME, _traceback.format_exc())
@@ -376,6 +371,16 @@ def warn_if_multiple_covers(mapping, parent_widget=None, album_id: Optional[str]
 
     return True
 
+def get_albums_to_show(dialog_closed: set[str], album_mappings: dict[str, dict[str, Any]]) -> list[str]:
+    albums_to_show = []
+    for aid, entry in album_mappings.items():
+        m = entry.get('mapping') if isinstance(entry, dict) and 'mapping' in entry else entry
+        real_hashes = [k for k in m.keys() if k not in (None, "error")]
+        distinct = set(real_hashes)
+        diff = len(distinct) > 1 or (len(distinct) == 1 and None in m)
+        if diff and aid not in dialog_closed:
+            albums_to_show.append(aid)
+    return albums_to_show
 
 def protect_track_cover(track, file: Any):
     try:
@@ -455,15 +460,7 @@ def on_album_removed(album: Any):
         # Update or close the aggregated dialog depending on remaining albums to show
         try:
             # compute remaining albums that still need warnings and are not dismissed
-            albums_to_show = []
-            for aid, entry in all_album_mappings.items():
-                m = entry.get('mapping') if isinstance(entry, dict) and 'mapping' in entry else entry
-                real_hashes = [k for k in m.keys() if k not in (None, "error")]
-                distinct = set(real_hashes)
-                diff = len(distinct) > 1 or (len(distinct) == 1 and None in m)
-                if diff and aid not in album_dialog_closed:
-                    albums_to_show.append(aid)
-
+            albums_to_show = get_albums_to_show(album_dialog_closed, all_album_mappings)
             if not albums_to_show:
                 if all_albums_dialog is not None:
                     try:
@@ -476,7 +473,8 @@ def on_album_removed(album: Any):
                 filtered = {aid: all_album_mappings[aid] for aid in albums_to_show}
                 if all_albums_dialog is not None:
                     try:
-                        all_albums_dialog.update_html(format_aggregated_report(filtered))
+                        report_html, report_no_cover_html, report_errors_html = format_aggregated_report(filtered)
+                        all_albums_dialog.update_html(report_html, report_no_cover_html, report_errors_html)
                     except Exception:
                         pass
         except Exception:

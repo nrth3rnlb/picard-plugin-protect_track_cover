@@ -6,8 +6,8 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>532</width>
-    <height>441</height>
+       <width>696</width>
+       <height>604</height>
    </rect>
   </property>
   <property name="minimumSize">
@@ -63,13 +63,58 @@
     </layout>
    </item>
    <item>
-    <widget class="QTextBrowser" name="browser">
-     <property name="readOnly">
-      <bool>true</bool>
-     </property>
-     <property name="openExternalLinks">
-      <bool>false</bool>
-     </property>
+       <widget class="QTabWidget" name="tabWidget">
+           <widget class="QWidget" name="tab_with_cover">
+               <attribute name="title">
+                   <string>with a cover</string>
+               </attribute>
+               <layout class="QVBoxLayout" name="verticalLayout_2">
+                   <item>
+                       <widget class="QTextBrowser" name="browser">
+                           <property name="readOnly">
+                               <bool>true</bool>
+                           </property>
+                           <property name="openExternalLinks">
+                               <bool>false</bool>
+                           </property>
+                       </widget>
+                   </item>
+               </layout>
+           </widget>
+           <widget class="QWidget" name="tab_without_cover">
+               <attribute name="title">
+                   <string>without a cover</string>
+               </attribute>
+               <layout class="QVBoxLayout" name="verticalLayout_3">
+                   <item>
+                       <widget class="QTextBrowser" name="browser_no_cover">
+                           <property name="readOnly">
+                               <bool>true</bool>
+                           </property>
+                           <property name="openExternalLinks">
+                               <bool>false</bool>
+                           </property>
+                       </widget>
+                   </item>
+               </layout>
+           </widget>
+           <widget class="QWidget" name="tab_errors">
+               <attribute name="title">
+                   <string>errors</string>
+               </attribute>
+               <layout class="QVBoxLayout" name="verticalLayout_4">
+                   <item>
+                       <widget class="QTextBrowser" name="browser_errors">
+                           <property name="readOnly">
+                               <bool>true</bool>
+                           </property>
+                           <property name="openExternalLinks">
+                               <bool>false</bool>
+                           </property>
+                       </widget>
+                   </item>
+               </layout>
+           </widget>
     </widget>
    </item>
    <item>
