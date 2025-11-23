@@ -412,8 +412,6 @@ def protect_track_cover(track, file: Any):
         # scan embedded covers for the tracked files of this album
         mapping = scan_files_for_embedded_covers(file_list[album_id]["files"])
 
-        report = format_scan_report(mapping)
-        log.info("%s: Scan result for album %s:\n%s", PLUGIN_NAME, album_id, report)
         for h, paths in mapping.items():
             log.debug("%s: cover=%s files=%s", PLUGIN_NAME, h, ", ".join(os.path.basename(p) for p in paths))
 
