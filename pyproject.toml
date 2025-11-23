@@ -1,6 +1,6 @@
 [project]
 name = "picard-plugin-protect_track_cover"
-version = "0.2.0"
+version = "0.3.0"
 readme = "README.md"
 description = """
 Protect Track Cover Plugin for MusicBrainz Picard.
@@ -92,7 +92,7 @@ precommit-install = "pre-commit install -t commit-msg"
 
 [tool.commitizen]
 name = "cz_conventional_commits"
-version = "0.2.0"
+version = "0.3.0"
 tag_format = "v$version"
 update_changelog_on_bump = true
 gpg_sign = true

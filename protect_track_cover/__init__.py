@@ -23,7 +23,7 @@ Protect Track Cover Plugin for MusicBrainz Picard.
 Warns when tracks on an album use different covers and there is a
 potential danger that these will be replaced by the album cover.
 """
-PLUGIN_VERSION = "0.2.0"
+PLUGIN_VERSION = "0.3.0"
 PLUGIN_API_VERSIONS = ["2.0"]
 PLUGIN_LICENSE = "GPL-2.0"
 PLUGIN_LICENSE_URL = "https://www.gnu.org/licenses/gpl-2.0.html"

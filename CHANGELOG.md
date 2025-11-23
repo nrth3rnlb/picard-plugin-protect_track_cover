@@ -1,3 +1,10 @@
+## v0.3.0 (2025-11-23)
+
+### Feat
+
+- **time**: add album cover thumbnail preview with validation and scaling
+- **time**: add debounced album cover hash caching and improve error handling
+
 ## v0.2.0 (2025-11-20)
 
 ### Feat
