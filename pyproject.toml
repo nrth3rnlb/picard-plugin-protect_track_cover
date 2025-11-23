@@ -22,6 +22,7 @@ dependencies = [
     "PyJWT~=2.0",
     "python-dateutil~=2.7",
     "python_libdiscid~=2.0",
+    "pillow~=12.0",
 ]
 
 [project.optional-dependencies]

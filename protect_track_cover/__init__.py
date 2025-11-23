@@ -9,6 +9,7 @@ and there is a potential risk of these being replaced by the album cover.
 
 from __future__ import annotations
 
+import base64
 import os
 from typing import Any, List
 
@@ -30,12 +31,18 @@ PLUGIN_LICENSE_URL = "https://www.gnu.org/licenses/gpl-2.0.html"
 MUSICBRAINZ_ALBUMID = "musicbrainz_albumid"
 
 import hashlib
-import base64
 import traceback as _traceback
 
 from typing import Dict
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtCore import QTimer
+
+try:
+    from PIL import Image, UnidentifiedImageError
+
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
 
 from typing import Set
 
@@ -53,7 +60,17 @@ from picard.album import register_album_post_removal_processor
 _NO_ALBUM_KEY = "no_album"
 _HASH_ERROR = "error"
 
-album_file_hash_cache: Dict[str, Dict[str, Any]] = {}  # album_id -> { path -> {'hash':..., 'mtime':..., 'size':...} }
+THUMBNAIL_MAX_SIZE = 100
+IMAGE_MAX_DIMENSION = 4096
+MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024
+
+_THUMBNAIL_UNAVAILABLE_HTML = ('<div style="color: gray; font-style: italic;">Image invalid or too large for '
+                               'preview.</div>')
+_THUMBNAIL_PIL_MISSING_HTML = '<div style="color: gray; font-style: italic;">Python Image Library is missing.</div>'
+# Global cache: per-album file hash cache
+# Structure: album_id -> { path -> {'hash':..., 'mtime':..., 'size':..., 'thumbnail_html':...} }
+album_file_hash_cache: Dict[str, Dict[str, Any]] = {}
+
 _pending_warn_albums: Set[str] = set()
 # debounce time for warnings
 _WARN_DEBOUNCE_MILLISECONDS = 500
@@ -79,6 +96,46 @@ def _get_file_stat(path: str) -> tuple[float | None, int | None]:
     except IOError:
         return None, None
 
+def _is_cache_valid(cached: Dict[str, Any] | None, mtime: float | None, size: int | None,
+                    required_cache_key: str | None = None) -> bool:
+    """
+    Checks if the cached entry is valid based on mtime, size, and optional required key.
+    """
+    return (cached and mtime is not None and size is not None and
+            cached.get("mtime") == mtime and cached.get("size") == size and
+            (required_cache_key is None or (
+                    required_cache_key in cached and cached.get(required_cache_key) is not None)))
+
+def get_cached_thumbnail_html(path: str, album_id: str | None, idx: int) -> str:
+    """
+    Returns cached thumbnail HTML string or regenerates it if not cached or outdated.
+    """
+    album_cache = album_file_hash_cache.setdefault(album_id if album_id else _NO_ALBUM_KEY, {})
+    cached = album_cache.get(path)
+    mtime, size = _get_file_stat(path)
+    if _is_cache_valid(cached, mtime, size, "thumbnail_html"):
+        return cached["thumbnail_html"]
+    # Not cached or outdated - generate new
+    img_data = get_first_picture_bytes(path)
+    h = get_file_cover_hash(path, album_id)
+    if img_data:
+        # Reuse thumbnail if hash is the same and thumbnail is cached
+        if cached and "thumbnail_html" in cached and cached.get("hash") == h:
+            thumbnail_html = cached["thumbnail_html"]
+        else:
+            thumbnail_html = _generate_thumbnail_html(img_data, album_id, idx)
+    else:
+        thumbnail_html = _THUMBNAIL_UNAVAILABLE_HTML
+
+    # Update cache only if file stats are valid
+    if mtime is not None:
+        update_dict = {"mtime": mtime, "size": size, "thumbnail_html": thumbnail_html}
+        if h is not None:
+            update_dict["hash"] = h
+        album_cache[path] = {**album_cache.get(path, {}), **update_dict}
+
+    return thumbnail_html
+
 def get_file_cover_hash(path: str, album_id: str | None = None) -> str | None:
     """
     Calculates the SHA256 hash of the embedded cover of the file.
@@ -88,15 +145,21 @@ def get_file_cover_hash(path: str, album_id: str | None = None) -> str | None:
     album_cache = album_file_hash_cache.setdefault(album_id if album_id else _NO_ALBUM_KEY, {})
     cached = album_cache.get(path)
     mtime, size = _get_file_stat(path)
-    if cached and cached.get("mtime") == mtime and cached.get("size") == size:
+    if _is_cache_valid(cached, mtime, size):
         return cached.get("hash")
-    # not cached or changed - compute
+    # Not cached or outdated - recalculate
     try:
         data = get_first_picture_bytes(path)
         h = hashlib.sha256(data).hexdigest() if data else None
     except IOError:
         h = _HASH_ERROR
-    album_cache[path] = {"hash": h, "mtime": mtime, "size": size}
+    # Update cache only if file stats are valid
+    if mtime is not None:
+        current = album_cache.get(path, {})
+        if current.get("hash") != h:
+            # invalidate thumbnail_html
+            current = {k: v for k, v in current.items() if k != "thumbnail_html"}
+        album_cache[path] = {**current, "hash": h, "mtime": mtime, "size": size}
     return h
 
 def build_mapping_from_cache(paths: list[str], album_id: str | None) -> dict:
@@ -267,6 +330,7 @@ class AlbumsWarningDialog(QDialog):
         self.iconLabel.setScaledContents(False)
 
     def update_html(self, html: str = "", html_no_cover: str = "", html_errors: str = ""):
+        log.debug("%s: Updating aggregated dialog HTML content with\n\n%s", PLUGIN_NAME, html)
         self.browser.setHtml(html)
         self.browser_no_cover.setHtml(html_no_cover)
         self.browser_errors.setHtml(html_errors)
@@ -280,43 +344,119 @@ class AlbumsWarningDialog(QDialog):
     def _on_close_clicked(self):
         self.close()
 
+def format_bytes(size: int) -> str:
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size < 1024.0:
+            return f"{size:.0f} {unit}"
+        size /= 1024.0
+    return f"{size:.0f} TB"
+
+def _generate_thumbnail_html(img_data: bytes, album_id: str | None, idx: int) -> str:
+    """
+    Generate HTML for a thumbnail image or a fallback placeholder.
+    Validates, scales, and encodes the image data.
+    """
+    if not PIL_AVAILABLE:
+        return _THUMBNAIL_PIL_MISSING_HTML
+    from PIL import Image, UnidentifiedImageError
+    from io import BytesIO
+
+    if len(img_data) > MAX_IMAGE_SIZE_BYTES:
+        return (f'<div style="color: gray; font-style: italic;">Image data exceeds '
+                f'{format_bytes(MAX_IMAGE_SIZE_BYTES)} limit for preview.</div>')
+
+    img_io = BytesIO(img_data)
+    try:
+        img = Image.open(img_io)
+        if img.size[0] > IMAGE_MAX_DIMENSION or img.size[1] > IMAGE_MAX_DIMENSION:
+            img.close()
+            raise ValueError(f"Image dimensions exceed maximum of {IMAGE_MAX_DIMENSION} pixels.")
+        try:
+            # Always create a copy first for independence
+            final_img = img.copy()
+            # Robust transparency detection
+            has_transparency = (final_img.mode in ('RGBA', 'LA') or
+                                (final_img.mode == 'P' and 'transparency' in final_img.info))
+            try:
+                if final_img.mode not in ('RGB', 'RGBA'):
+                    new_img = final_img.convert('RGBA' if has_transparency else 'RGB')
+                    final_img.close()
+                    final_img = new_img
+                # Now final_img is independent and valid
+                final_img.thumbnail((THUMBNAIL_MAX_SIZE, THUMBNAIL_MAX_SIZE), Image.Resampling.LANCZOS)
+                output = BytesIO()
+                try:
+                    final_img.save(output, format='PNG')
+                    scaled_data = output.getvalue()
+                    img_b64 = base64.b64encode(scaled_data).decode('utf-8')
+                    return (f'<img src="data:image/png;base64,{img_b64}" alt="Cover preview" style="max-width:100px; '
+                            f'max-height:100px; margin:5px;">')
+                finally:
+                    output.close()
+            finally:
+                final_img.close()
+        finally:
+            img.close()
+    except UnidentifiedImageError:
+        log.error("%s: Unidentified image format in album %s, cover group %d", PLUGIN_NAME, album_id or "unknown album",
+                  idx)
+        return '<div style="color: gray; font-style: italic;">Invalid image format.</div>'
+    except ValueError as e:
+        log.error("%s: %s in album %s, cover group %d", PLUGIN_NAME, str(e), album_id or "unknown album", idx)
+        return '<div style="color: gray; font-style: italic;">Image dimensions too large.</div>'
+    except OSError:
+        log.error("%s: I/O error reading image in album %s, cover group %d", PLUGIN_NAME, album_id or "unknown album",
+                  idx)
+        return '<div style="color: gray; font-style: italic;">I/O error reading image.</div>'
+    finally:
+        img_io.close()
+
 def _format_album_block(album_id: str, mapping: Dict, album_name: str | None = None) -> tuple[str, str, str]:
     """
-    Create three HTML blocks for a single album showing grouped tracks.
-    Returns tuple of (main_html, no_cover_html, errors_html)
+    Build HTML block for a single album from its mapping.
     """
     parts = []
     parts_no_cover = []
     parts_errors = []
 
     album_label = album_name or album_id
-    parts.append(f"<h3>{album_label}</h3>")
+    parts.append(f"<h2>{album_label}</h2>")
     # Filter and sort groups: display 'no cover' and 'error' last/first
-    normal_groups = [(h, paths) for h, paths in mapping.items() if h not in (None, _HASH_ERROR)]
+    normal_groups = [(cover_hash, paths) for cover_hash, paths in mapping.items() if
+                     cover_hash not in (None, _HASH_ERROR)]
     no_cover = mapping.get(None, [])
     errors = mapping.get(_HASH_ERROR, [])
 
     if not normal_groups and not no_cover and not errors:
         parts.append("<p><em>No files scanned for this album yet.</em></p>")
-        return "\n".join(parts)
+        return "\n".join(parts), "\n".join(parts_no_cover), "\n".join(parts_errors)
 
     # Label cover groups without revealing checksums
-    for idx, (_h, paths) in enumerate(sorted(normal_groups, key=lambda x: -len(x[1])), start=1):
-        parts.append(f"<b>Cover group {idx} — {len(paths)} file(s):</b>")
-        parts.append("<ul>")
-        for p in paths:
-            parts.append(f"<li>{os.path.basename(p)}</li>")
-        parts.append("</ul>")
+    for idx, (h, paths) in enumerate(sorted(normal_groups, key=lambda x: -len(x[1])), start=1):
+        # parts.append(f"<h3>Cover {idx} - {len(paths)} file(s):</h3>")
+        thumbnail_html = get_cached_thumbnail_html(paths[0], album_id, idx)
+        if thumbnail_html:
+            parts.append("<table style='margin: 1em; border-collapse: collapse;'>")
+            parts.append("<tr>")
+            parts.append(f"<td style='vertical-align: top; padding-right: 1em;'>{thumbnail_html}</td>")
+            parts.append("<td style='vertical-align: top;'>")
+            parts.append("<ul>")
+            for p in paths:
+                parts.append(f"<li>{os.path.basename(p)}</li>")
+            parts.append("</ul>")
+            parts.append("</td>")
+            parts.append("</tr>")
+            parts.append("</table>")
 
     if no_cover:
-        parts_no_cover.append(f"<b>No embedded cover — {len(no_cover)} file(s):</b>")
+        parts_no_cover.append(f"<b>No embedded cover - {len(no_cover)} file(s):</b>")
         parts_no_cover.append("<ul>")
         for p in no_cover:
             parts_no_cover.append(f"<li>{os.path.basename(p)}</li>")
         parts_no_cover.append("</ul>")
 
     if errors:
-        parts_errors.append(f"<b>Read errors — {len(errors)} file(s):</b>")
+        parts_errors.append(f"<b>Read errors - {len(errors)} file(s):</b>")
         parts_errors.append("<ul>")
         for p in errors:
             parts_errors.append(f"<li>{os.path.basename(p)}</li>")
@@ -325,12 +465,14 @@ def _format_album_block(album_id: str, mapping: Dict, album_name: str | None = N
     return "\n".join(parts), "\n".join(parts_no_cover), "\n".join(parts_errors)
 
 def format_aggregated_report(all_mappings: Dict[str, Dict]) -> tuple[str, str, str]:
-    """Build full HTML report for all albums that currently have differing covers.
+    """
+    Build full HTML report for all albums that currently have differing covers.
     Accepts values in the shape {'mapping': {...}, 'name': '...'} for each album_id.
     """
-    parts: list[str] = ["<html><body>"]
-    parts_no_cover: list[str] = ["<html><body>"]
-    parts_errors: list[str] = ["<html><body>"]
+    parts: list[str] = ["<html><head><meta charset='utf-8'></head><body>"]
+    parts_no_cover: list[str] = ["<html><head><meta charset='utf-8'></head><body>"]
+    parts_errors: list[str] = ["<html><head><meta charset='utf-8'></head><body>"]
+
     any_shown = False
     for album_id, entry in all_mappings.items():
         # support both old and new shapes (entry may be mapping directly)
