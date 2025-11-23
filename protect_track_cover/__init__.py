@@ -36,6 +36,8 @@ import traceback as _traceback
 from typing import Dict
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtCore import QTimer
+from PyQt5.QtWidgets import QVBoxLayout, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QGroupBox
+from PyQt5.QtGui import QPixmap
 
 try:
     from PIL import Image, UnidentifiedImageError
@@ -106,35 +108,6 @@ def _is_cache_valid(cached: Dict[str, Any] | None, mtime: float | None, size: in
             (required_cache_key is None or (
                     required_cache_key in cached and cached.get(required_cache_key) is not None)))
 
-def get_cached_thumbnail_html(path: str, album_id: str | None, idx: int) -> str:
-    """
-    Returns cached thumbnail HTML string or regenerates it if not cached or outdated.
-    """
-    album_cache = album_file_hash_cache.setdefault(album_id if album_id else _NO_ALBUM_KEY, {})
-    cached = album_cache.get(path)
-    mtime, size = _get_file_stat(path)
-    if _is_cache_valid(cached, mtime, size, "thumbnail_html"):
-        return cached["thumbnail_html"]
-    # Not cached or outdated - generate new
-    img_data = get_first_picture_bytes(path)
-    h = get_file_cover_hash(path, album_id)
-    if img_data:
-        # Reuse thumbnail if hash is the same and thumbnail is cached
-        if cached and "thumbnail_html" in cached and cached.get("hash") == h:
-            thumbnail_html = cached["thumbnail_html"]
-        else:
-            thumbnail_html = _generate_thumbnail_html(img_data, album_id, idx)
-    else:
-        thumbnail_html = _THUMBNAIL_UNAVAILABLE_HTML
-
-    # Update cache only if file stats are valid
-    if mtime is not None:
-        update_dict = {"mtime": mtime, "size": size, "thumbnail_html": thumbnail_html}
-        if h is not None:
-            update_dict["hash"] = h
-        album_cache[path] = {**album_cache.get(path, {}), **update_dict}
-
-    return thumbnail_html
 
 def get_file_cover_hash(path: str, album_id: str | None = None) -> str | None:
     """
@@ -329,11 +302,14 @@ class AlbumsWarningDialog(QDialog):
         self.iconLabel.setPixmap(pixmap)
         self.iconLabel.setScaledContents(False)
 
-    def update_html(self, html: str = "", html_no_cover: str = "", html_errors: str = ""):
-        log.debug("%s: Updating aggregated dialog HTML content with\n\n%s", PLUGIN_NAME, html)
-        self.browser.setHtml(html)
-        self.browser_no_cover.setHtml(html_no_cover)
-        self.browser_errors.setHtml(html_errors)
+    def update_dialog(self, with_cover: QGroupBox, without_cover: QGroupBox, with_errors: QGroupBox):
+        self.tab_with_cover.setLayout(QVBoxLayout())
+        self.tab_with_cover.layout().addWidget(with_cover)
+        self.tab_without_cover.setLayout(QVBoxLayout())
+        self.tab_without_cover.layout().addWidget(without_cover)
+        self.tab_with_errors.setLayout(QVBoxLayout())
+        self.tab_with_errors.layout().addWidget(with_errors)
+
         try:
             self.show()
             self.raise_()
@@ -411,100 +387,146 @@ def _generate_thumbnail_html(img_data: bytes, album_id: str | None, idx: int) ->
     finally:
         img_io.close()
 
-def _format_album_block(album_id: str, mapping: Dict, album_name: str | None = None) -> tuple[str, str, str]:
+def get_cached_thumbnail_data(path: str, album_id: str | None, idx: int) -> str | None:
     """
-    Build HTML block for a single album from its mapping.
+    Returns cached base64-encoded thumbnail data or regenerates it if not cached or outdated.
     """
-    parts = []
-    parts_no_cover = []
-    parts_errors = []
+    album_cache = album_file_hash_cache.setdefault(album_id if album_id else _NO_ALBUM_KEY, {})
+    cached = album_cache.get(path)
+    mtime, size = _get_file_stat(path)
+    if _is_cache_valid(cached, mtime, size, "thumbnail_data"):
+        return cached["thumbnail_data"]
+    # Not cached or outdated - generate new
+    img_data = get_first_picture_bytes(path)
+    h = get_file_cover_hash(path, album_id)
+    if img_data:
+        # Reuse thumbnail if hash is the same and thumbnail is cached
+        if cached and "thumbnail_data" in cached and cached.get("hash") == h:
+            thumbnail_data = cached["thumbnail_data"]
+        else:
+            thumbnail_data = _generate_thumbnail_data(img_data, album_id, idx)
+    else:
+        thumbnail_data = None
 
-    album_label = album_name or album_id
-    parts.append(f"<h2>{album_label}</h2>")
-    # Filter and sort groups: display 'no cover' and 'error' last/first
-    normal_groups = [(cover_hash, paths) for cover_hash, paths in mapping.items() if
-                     cover_hash not in (None, _HASH_ERROR)]
-    no_cover = mapping.get(None, [])
-    errors = mapping.get(_HASH_ERROR, [])
+    # Update cache only if file stats are valid
+    if mtime is not None:
+        update_dict = {"mtime": mtime, "size": size, "thumbnail_data": thumbnail_data}
+        if h is not None:
+            update_dict["hash"] = h
+        album_cache[path] = {**album_cache.get(path, {}), **update_dict}
 
-    if not normal_groups and not no_cover and not errors:
-        parts.append("<p><em>No files scanned for this album yet.</em></p>")
-        return "\n".join(parts), "\n".join(parts_no_cover), "\n".join(parts_errors)
+    return thumbnail_data
 
-    # Label cover groups without revealing checksums
-    for idx, (h, paths) in enumerate(sorted(normal_groups, key=lambda x: -len(x[1])), start=1):
-        # parts.append(f"<h3>Cover {idx} - {len(paths)} file(s):</h3>")
-        thumbnail_html = get_cached_thumbnail_html(paths[0], album_id, idx)
-        if thumbnail_html:
-            parts.append("<table style='margin: 1em; border-collapse: collapse;'>")
-            parts.append("<tr>")
-            parts.append(f"<td style='vertical-align: top; padding-right: 1em;'>{thumbnail_html}</td>")
-            parts.append("<td style='vertical-align: top;'>")
-            parts.append("<ul>")
-            for p in paths:
-                parts.append(f"<li>{os.path.basename(p)}</li>")
-            parts.append("</ul>")
-            parts.append("</td>")
-            parts.append("</tr>")
-            parts.append("</table>")
-
-    if no_cover:
-        parts_no_cover.append(f"<b>No embedded cover - {len(no_cover)} file(s):</b>")
-        parts_no_cover.append("<ul>")
-        for p in no_cover:
-            parts_no_cover.append(f"<li>{os.path.basename(p)}</li>")
-        parts_no_cover.append("</ul>")
-
-    if errors:
-        parts_errors.append(f"<b>Read errors - {len(errors)} file(s):</b>")
-        parts_errors.append("<ul>")
-        for p in errors:
-            parts_errors.append(f"<li>{os.path.basename(p)}</li>")
-        parts_errors.append("</ul>")
-
-    return "\n".join(parts), "\n".join(parts_no_cover), "\n".join(parts_errors)
-
-def format_aggregated_report(all_mappings: Dict[str, Dict]) -> tuple[str, str, str]:
+def _generate_thumbnail_data(img_data: bytes, album_id: str | None, idx: int) -> str | None:
     """
-    Build full HTML report for all albums that currently have differing covers.
-    Accepts values in the shape {'mapping': {...}, 'name': '...'} for each album_id.
+    Generate base64-encoded thumbnail data or return None.
+    Validates, scales, and encodes the image data.
     """
-    parts: list[str] = ["<html><head><meta charset='utf-8'></head><body>"]
-    parts_no_cover: list[str] = ["<html><head><meta charset='utf-8'></head><body>"]
-    parts_errors: list[str] = ["<html><head><meta charset='utf-8'></head><body>"]
+    if not PIL_AVAILABLE:
+        return None
+    from PIL import Image, UnidentifiedImageError
+    from io import BytesIO
 
-    any_shown = False
+    if len(img_data) > MAX_IMAGE_SIZE_BYTES:
+        return None
+
+    img_io = BytesIO(img_data)
+    try:
+        img = Image.open(img_io)
+        if img.size[0] > IMAGE_MAX_DIMENSION or img.size[1] > IMAGE_MAX_DIMENSION:
+            img.close()
+            raise ValueError(f"Image dimensions exceed maximum of {IMAGE_MAX_DIMENSION} pixels.")
+        try:
+            # Always create a copy first for independence
+            final_img = img.copy()
+            # Robust transparency detection
+            has_transparency = (final_img.mode in ('RGBA', 'LA') or
+                                (final_img.mode == 'P' and 'transparency' in final_img.info))
+            try:
+                if final_img.mode not in ('RGB', 'RGBA'):
+                    new_img = final_img.convert('RGBA' if has_transparency else 'RGB')
+                    final_img.close()
+                    final_img = new_img
+                # Now final_img is independent and valid
+                final_img.thumbnail((THUMBNAIL_MAX_SIZE, THUMBNAIL_MAX_SIZE), Image.Resampling.LANCZOS)
+                output = BytesIO()
+                try:
+                    final_img.save(output, format='PNG')
+                    scaled_data = output.getvalue()
+                    return base64.b64encode(scaled_data).decode('utf-8')
+                finally:
+                    output.close()
+            finally:
+                final_img.close()
+        finally:
+            img.close()
+    except (UnidentifiedImageError, ValueError, OSError):
+        log.error("%s: Error generating thumbnail data in album %s, cover group %d", PLUGIN_NAME,
+                  album_id or "unknown album", idx)
+        return None
+    finally:
+        img_io.close()
+
+def prepare_aggregated_report(all_mappings: Dict[str, Dict]) -> tuple[QGroupBox, QGroupBox, QGroupBox]:
     for album_id, entry in all_mappings.items():
-        # support both old and new shapes (entry may be mapping directly)
         mapping = entry.get("mapping") if isinstance(entry, dict) and "mapping" in entry else entry
         album_name = entry.get("name") if isinstance(entry, dict) else None
 
         real_hashes = [k for k in mapping.keys() if k not in (None, _HASH_ERROR)]
         distinct = set(real_hashes)
         different_covers = len(distinct) > 1 or (len(distinct) == 1 and None in mapping)
-        if different_covers:
-            any_shown = True
-            part, no_cover, errors = _format_album_block(album_id, mapping, album_name)
-            if part:
-                parts.append(part)
-            if no_cover:
-                parts_no_cover.append(no_cover)
-            if errors:
-                parts_errors.append(errors)
+        if not different_covers:
+            continue
 
-    if not any_shown:
-        parts.append("<p><em>No albums with differing embedded covers at the moment.</em></p>")
-    parts.append("</body></html>")
+        any_shown = True
+        album_label = album_name or album_id
 
-    if not parts_no_cover or len(parts_no_cover) == 1:
-        parts_no_cover.append("<p><em>No albums with files lacking embedded covers at the moment.</em></p>")
-    parts_no_cover.append("</body></html>")
+        # QGroupBox für jedes Album (einklappbar)
+        cover_list = QGroupBox(f"Album: {album_label}")
+        cover_list.setCheckable(True)
+        cover_list.setChecked(False)
+        album_layout = QVBoxLayout(cover_list)
 
-    if not parts_errors or len(parts_errors) == 1:
-        parts_errors.append("<p><em>No albums with file read errors at the moment.</em></p>")
-    parts_errors.append("</body></html>")
+        normal_groups = [(cover_hash, paths) for cover_hash, paths in mapping.items() if
+                         cover_hash not in (None, _HASH_ERROR)]
+        for idx, (h, paths) in enumerate(sorted(normal_groups, key=lambda x: -len(x[1])), start=1):
+            row_layout = QHBoxLayout()
 
-    return "\n".join(parts), "\n".join(parts_no_cover), "\n".join(parts_errors)
+            # Thumbnail
+            thumbnail_label = QLabel()
+            thumbnail_data = get_cached_thumbnail_data(paths[0], album_id, idx)
+            if thumbnail_data:
+                pixmap = QPixmap()
+                pixmap.loadFromData(base64.b64decode(thumbnail_data))
+                if not pixmap.isNull():
+                    thumbnail_label.setPixmap(pixmap.scaled(100, 100, Qt.KeepAspectRatio))
+            row_layout.addWidget(thumbnail_label)
+
+            # Liste der Dateinamen
+            list_widget = QListWidget()
+            for p in paths:
+                list_widget.addItem(QListWidgetItem(os.path.basename(p)))
+            row_layout.addWidget(list_widget)
+
+            album_layout.addLayout(row_layout)
+
+        # No Cover
+        no_cover = mapping.get(None, [])
+        no_cover_list = QListWidget()
+        no_cover_list.addItem(QListWidgetItem(f"No embedded cover - {len(no_cover)} file(s):"))
+        if no_cover:
+            for p in no_cover:
+                no_cover_list.addItem(QListWidgetItem(os.path.basename(p)))
+
+        # Errors
+        errors = mapping.get(_HASH_ERROR, [])
+        errors_list = QListWidget()
+        errors_list.addItem(QListWidgetItem(f"Read errors - {len(errors)} file(s):"))
+        if errors:
+            for p in errors:
+                errors_list.addItem(QListWidgetItem(os.path.basename(p)))
+
+    return cover_list, no_cover_list, errors_list
 
 def warn_if_multiple_covers(mapping, parent_widget=None, album_id: str | None = None, album_name: str | None = None):
     """
@@ -545,7 +567,7 @@ def warn_if_multiple_covers(mapping, parent_widget=None, album_id: str | None = 
 
     # Build aggregated HTML only for albums_to_show
     filtered = {aid: all_album_mappings[aid] for aid in albums_to_show}
-    report_html, report_no_cover_html, report_errors_html = format_aggregated_report(filtered)
+    with_cover, without_cover, errors = prepare_aggregated_report(filtered)
 
     app = QApplication.instance()
     created_app = False
@@ -561,7 +583,7 @@ def warn_if_multiple_covers(mapping, parent_widget=None, album_id: str | None = 
                 all_albums_dialog.destroyed.connect(lambda _: globals().update({'all_albums_dialog': None}))
             except Exception:
                 pass
-        all_albums_dialog.update_html(report_html, report_no_cover_html, report_errors_html)
+        all_albums_dialog.update_dialog(with_cover, without_cover, errors)
     except Exception as e:
         log.error("%s: Failed updating/creating aggregated dialog: %s", PLUGIN_NAME, e)
         log.error("%s: Traceback: %s", PLUGIN_NAME, _traceback.format_exc())
@@ -685,11 +707,8 @@ def on_album_removed(album: Any):
                 # refresh dialog contents for remaining albums
                 filtered = {aid: all_album_mappings[aid] for aid in albums_to_show}
                 if all_albums_dialog is not None:
-                    try:
-                        report_html, report_no_cover_html, report_errors_html = format_aggregated_report(filtered)
-                        all_albums_dialog.update_html(report_html, report_no_cover_html, report_errors_html)
-                    except Exception:
-                        pass
+                    with_cover, without_cover, errors = prepare_aggregated_report(filtered)
+                    all_albums_dialog.update_dialog(with_cover, without_cover, errors)
         except Exception:
             log.error("%s: Error updating dialog after album removal: %s", PLUGIN_NAME, _traceback.format_exc())
 
