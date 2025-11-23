@@ -10,8 +10,7 @@ and there is a potential risk of these being replaced by the album cover.
 from __future__ import annotations
 
 import os
-
-from typing import Any
+from typing import Any, List
 
 from PyQt5 import uic
 
@@ -36,9 +35,9 @@ import traceback as _traceback
 
 from typing import Dict
 from PyQt5.QtWidgets import QApplication
+from PyQt5.QtCore import QTimer
 
-
-from typing import Optional
+from typing import Set
 
 from mutagen import File
 from mutagen.id3 import ID3
@@ -51,11 +50,19 @@ from picard import log
 from picard.file import register_file_post_addition_to_track_processor
 from picard.album import register_album_post_removal_processor
 
+_NO_ALBUM_KEY = "no_album"
+_HASH_ERROR = "error"
+
+album_file_hash_cache: Dict[str, Dict[str, Any]] = {}  # album_id -> { path -> {'hash':..., 'mtime':..., 'size':...} }
+_pending_warn_albums: Set[str] = set()
+# debounce time for warnings
+_WARN_DEBOUNCE_MILLISECONDS = 500
+
 file_list: Dict[str, Dict[str, Any]] = {}  # album_id -> {'files': [paths], 'name': album_name}
 # global aggregated state: value contains mapping + album name
 all_album_mappings: Dict[str, Dict[str, Any]] = {}  # album_id -> {'mapping': {cover_hash: [paths]}, 'name': album_name}
 
-all_albums_dialog: Optional[AlbumsWarningDialog] = None
+all_albums_dialog: AlbumsWarningDialog | None = None
 # global aggregated state
 all_dialog_closed: bool = False
 
@@ -65,6 +72,58 @@ album_dialog_closed: Set[str] = set()
 # new global to remember a short fingerprint of the mapping that was dismissed
 album_dismissed_signature: Dict[str, str] = {}
 
+def _get_file_stat(path: str) -> tuple[float | None, int | None]:
+    try:
+        st = os.stat(path)
+        return st.st_mtime, st.st_size
+    except IOError:
+        return None, None
+
+def get_file_cover_hash(path: str, album_id: str | None = None) -> str | None:
+    """
+    Calculates the SHA256 hash of the embedded cover of the file.
+    Uses a cache to avoid repeated calculations.
+    Returns the hash as a hex string, _HASH_ERROR if there is a read error or None if there is no cover.
+    """
+    album_cache = album_file_hash_cache.setdefault(album_id if album_id else _NO_ALBUM_KEY, {})
+    cached = album_cache.get(path)
+    mtime, size = _get_file_stat(path)
+    if cached and cached.get("mtime") == mtime and cached.get("size") == size:
+        return cached.get("hash")
+    # not cached or changed - compute
+    try:
+        data = get_first_picture_bytes(path)
+        h = hashlib.sha256(data).hexdigest() if data else None
+    except IOError:
+        h = _HASH_ERROR
+    album_cache[path] = {"hash": h, "mtime": mtime, "size": size}
+    return h
+
+def build_mapping_from_cache(paths: list[str], album_id: str | None) -> dict:
+    """
+    Quickly builds the cover_status_to_files structure from the cache (calculates missing entries).
+    """
+    cover_status_to_files: Dict[str | None, List[str]] = {}
+    for p in paths:
+        h = get_file_cover_hash(p, album_id=album_id)
+        if h == _HASH_ERROR:
+            cover_status_to_files.setdefault(_HASH_ERROR, []).append(p)
+        else:
+            cover_status_to_files.setdefault(h, []).append(p)
+    return cover_status_to_files
+
+def _delayed_warn(album_id: str):
+    if album_id not in _pending_warn_albums:
+        return
+    try:
+        _pending_warn_albums.discard(album_id)
+        files = file_list.get(album_id, {}).get("files", [])
+        album_name = file_list.get(album_id, {}).get("name")
+        mapping = build_mapping_from_cache(files, album_id)
+        warn_if_multiple_covers(mapping, album_id=album_id, album_name=album_name)
+    except (KeyError, AttributeError):
+        log.error("%s: Error in delayed warn for album %s", PLUGIN_NAME, album_id)
+        log.debug("%s: %s", PLUGIN_NAME, _traceback.format_exc())
 
 def get_first_picture_bytes(path):
     """
@@ -151,7 +210,7 @@ def scan_files_for_embedded_covers(file_paths):
                 h = None
             mapping.setdefault(h, []).append(path)
         except Exception:
-            mapping.setdefault("error", []).append(path)
+            mapping.setdefault(_HASH_ERROR, []).append(path)
     return mapping
 
 
@@ -165,7 +224,7 @@ def format_scan_report(mapping):
     for h, paths in mapping.items():
         if h is None:
             parts.append(f"- {len(paths)} files with no embedded cover:")
-        elif h == "error":
+        elif h == _HASH_ERROR:
             parts.append(f"- {len(paths)} files with read errors:")
         else:
             parts.append(f"- {len(paths)} files with cover hash {h}:")
@@ -221,7 +280,7 @@ class AlbumsWarningDialog(QDialog):
     def _on_close_clicked(self):
         self.close()
 
-def _format_album_block(album_id: str, mapping: Dict, album_name: Optional[str] = None) -> tuple[str, str, str]:
+def _format_album_block(album_id: str, mapping: Dict, album_name: str | None = None) -> tuple[str, str, str]:
     """
     Create three HTML blocks for a single album showing grouped tracks.
     Returns tuple of (main_html, no_cover_html, errors_html)
@@ -233,9 +292,9 @@ def _format_album_block(album_id: str, mapping: Dict, album_name: Optional[str] 
     album_label = album_name or album_id
     parts.append(f"<h3>{album_label}</h3>")
     # Filter and sort groups: display 'no cover' and 'error' last/first
-    normal_groups = [(h, paths) for h, paths in mapping.items() if h not in (None, "error")]
+    normal_groups = [(h, paths) for h, paths in mapping.items() if h not in (None, _HASH_ERROR)]
     no_cover = mapping.get(None, [])
-    errors = mapping.get("error", [])
+    errors = mapping.get(_HASH_ERROR, [])
 
     if not normal_groups and not no_cover and not errors:
         parts.append("<p><em>No files scanned for this album yet.</em></p>")
@@ -278,7 +337,7 @@ def format_aggregated_report(all_mappings: Dict[str, Dict]) -> tuple[str, str, s
         mapping = entry.get("mapping") if isinstance(entry, dict) and "mapping" in entry else entry
         album_name = entry.get("name") if isinstance(entry, dict) else None
 
-        real_hashes = [k for k in mapping.keys() if k not in (None, "error")]
+        real_hashes = [k for k in mapping.keys() if k not in (None, _HASH_ERROR)]
         distinct = set(real_hashes)
         different_covers = len(distinct) > 1 or (len(distinct) == 1 and None in mapping)
         if different_covers:
@@ -305,7 +364,7 @@ def format_aggregated_report(all_mappings: Dict[str, Dict]) -> tuple[str, str, s
 
     return "\n".join(parts), "\n".join(parts_no_cover), "\n".join(parts_errors)
 
-def warn_if_multiple_covers(mapping, parent_widget=None, album_id: Optional[str] = None, album_name: Optional[str] = None):
+def warn_if_multiple_covers(mapping, parent_widget=None, album_id: str | None = None, album_name: str | None = None):
     """
     Non-blocking aggregated warning for all albums.
     - Updates internal per-album mapping and stored album name.
@@ -314,7 +373,7 @@ def warn_if_multiple_covers(mapping, parent_widget=None, album_id: Optional[str]
     global all_albums_dialog, all_album_mappings, album_dialog_closed
 
     # compute whether this album has multiple covers
-    real_hashes = [k for k in mapping.keys() if k not in (None, "error")]
+    real_hashes = [k for k in mapping.keys() if k not in (None, _HASH_ERROR)]
     distinct = set(real_hashes)
     different_covers = len(distinct) > 1 or (len(distinct) == 1 and None in mapping)
 
@@ -376,7 +435,7 @@ def get_albums_to_show(dialog_closed: set[str], album_mappings: dict[str, dict[s
     albums_to_show = []
     for aid, entry in album_mappings.items():
         m = entry.get('mapping') if isinstance(entry, dict) and 'mapping' in entry else entry
-        real_hashes = [k for k in m.keys() if k not in (None, "error")]
+        real_hashes = [k for k in m.keys() if k not in (None, _HASH_ERROR)]
         distinct = set(real_hashes)
         diff = len(distinct) > 1 or (len(distinct) == 1 and None in m)
         if diff and aid not in dialog_closed:
@@ -409,28 +468,34 @@ def protect_track_cover(track, file: Any):
         if getattr(file, "filename", None) and file.filename not in file_list[album_id]["files"]:
             file_list[album_id]["files"].append(file.filename)
 
-        # scan embedded covers for the tracked files of this album
-        mapping = scan_files_for_embedded_covers(file_list[album_id]["files"])
+        if getattr(file, "filename", None):
+            try:
+                # prepopulate cache
+                get_file_cover_hash(file.filename, album_id=album_id)
+            except Exception:
+                # swallow - error treated as _HASH_ERROR in the cache
+                pass
+
+        mapping = build_mapping_from_cache(file_list[album_id]["files"], album_id)
 
         for h, paths in mapping.items():
             log.debug("%s: cover=%s files=%s", PLUGIN_NAME, h, ", ".join(os.path.basename(p) for p in paths))
 
-        # non-blocking warning/update dialog per album (pass album_name)
-        try:
-            warn_if_multiple_covers(mapping, album_id=album_id, album_name=file_list[album_id].get("name"))
-        except Exception:
-            log.error("%s: Error showing/updating warning dialog for album %s: %s", PLUGIN_NAME, album_id, _traceback.format_exc())
+        # Do not immediately update UI for every file - Debounce
+        if album_id not in _pending_warn_albums:
+            _pending_warn_albums.add(album_id)
+            QTimer.singleShot(_WARN_DEBOUNCE_MILLISECONDS,
+                              lambda aid=album_id: _delayed_warn(aid))
+
+
 
     except Exception as e:
         log.error("%s: Error in protect_track_cover: %s", PLUGIN_NAME, e)
         log.error("%s: Traceback: %s", PLUGIN_NAME, _traceback.format_exc())
 
 
+
 def on_album_removed(album: Any):
-    """
-    Cleanup internal state for an album when Picard removes it.
-    Called via register_album_post_removal_processor(...).
-    """
     try:
         # determine album id robustly
         album_id = None
@@ -454,7 +519,14 @@ def on_album_removed(album: Any):
         try:
             album_dismissed_signature.pop(album_id, None)
         except Exception:
-            pass
+            log.warning("%s: Error removing dismissed signature for album %s", PLUGIN_NAME, album_id)
+
+        # clear cache and pending flags
+        try:
+            album_file_hash_cache.pop(album_id, None)
+            _pending_warn_albums.discard(album_id)
+        except Exception:
+            log.warning("%s: Error clearing cache for album %s", PLUGIN_NAME, album_id)
 
         # Update or close the aggregated dialog depending on remaining albums to show
         try:
