@@ -2,3 +2,20 @@ The Protect Track Cover plugin for MusicBrainz Picard warns when individual trac
 
 You can find more details in the source code:
 [protect_track_cover/__init__.py](https://github.com/nrth3rnlb/picard-plugin-protect_track_cover/blob/ffb88b183f2aa93fc99f42282c91716728fffa03/protect_track_cover/__init__.py)
+
+In order to display images, we need the Python Image Library.
+
+
+For Flatpak installations
+
+
+```
+flatpak run --command=sh org.musicbrainz.Picard
+
+
+python -m ensurepip --upgrade
+python -m pip install --user pillow
+```
+
+
+There's probably an easier way to do it, but this works too.
