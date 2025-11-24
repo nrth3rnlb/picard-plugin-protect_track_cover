@@ -63,7 +63,7 @@
     </layout>
    </item>
    <item>
-       <widget class="QTabWidget" name="tabWidget">
+       <widget class="QTabWidget" name="tabs">
            <property name="currentIndex">
                <number>0</number>
            </property>
@@ -73,11 +73,11 @@
                </attribute>
                <layout class="QVBoxLayout" name="verticalLayout_2">
                    <item>
-                       <widget class="QScrollArea" name="scrollArea">
+                       <widget class="QScrollArea" name="scrollarea_with_cover">
                            <property name="widgetResizable">
                                <bool>true</bool>
                            </property>
-                           <widget class="QWidget" name="scrollAreaWidgetContents">
+                           <widget class="QWidget" name="widget_scrollarea_with_cover">
                                <property name="geometry">
                                    <rect>
                                        <x>0</x>
@@ -86,69 +86,7 @@
                                        <height>438</height>
                                    </rect>
                                </property>
-                               <layout class="QVBoxLayout" name="verticalLayout_5">
-                                   <item>
-                                       <widget class="QGroupBox" name="groupBox">
-                                           <property name="title">
-                                               <string>GroupBox</string>
-                                           </property>
-                                           <property name="checkable">
-                                               <bool>true</bool>
-                                           </property>
-                                           <layout class="QHBoxLayout" name="horizontalLayout">
-                                               <item>
-                                                   <widget class="QWidget" name="widget" native="true">
-                                                       <layout class="QHBoxLayout" name="horizontalLayout_2">
-                                                           <item>
-                                                               <widget class="QLabel" name="label">
-                                                                   <property name="minimumSize">
-                                                                       <size>
-                                                                           <width>100</width>
-                                                                           <height>100</height>
-                                                                       </size>
-                                                                   </property>
-                                                                   <property name="maximumSize">
-                                                                       <size>
-                                                                           <width>100</width>
-                                                                           <height>100</height>
-                                                                       </size>
-                                                                   </property>
-                                                                   <property name="text">
-                                                                       <string>TextLabel</string>
-                                                                   </property>
-                                                               </widget>
-                                                           </item>
-                                                           <item>
-                                                               <widget class="QListWidget" name="listWidget">
-                                                                   <item>
-                                                                       <property name="text">
-                                                                           <string>Track 1</string>
-                                                                       </property>
-                                                                   </item>
-                                                                   <item>
-                                                                       <property name="text">
-                                                                           <string>New Item</string>
-                                                                       </property>
-                                                                   </item>
-                                                                   <item>
-                                                                       <property name="text">
-                                                                           <string>New Item</string>
-                                                                       </property>
-                                                                   </item>
-                                                                   <item>
-                                                                       <property name="text">
-                                                                           <string>New Item</string>
-                                                                       </property>
-                                                                   </item>
-                                                               </widget>
-                                                           </item>
-                                                       </layout>
-                                                   </widget>
-                                               </item>
-                                           </layout>
-                                       </widget>
-                                   </item>
-                               </layout>
+                               <layout class="QVBoxLayout" name="layout_with_cover"/>
                            </widget>
                        </widget>
                    </item>
@@ -158,13 +96,51 @@
                <attribute name="title">
                    <string>without a cover</string>
                </attribute>
-               <layout class="QVBoxLayout" name="verticalLayout_3"/>
+               <layout class="QVBoxLayout" name="verticalLayout_3">
+                   <item>
+                       <widget class="QScrollArea" name="scrollarea_without_cover">
+                           <property name="widgetResizable">
+                               <bool>true</bool>
+                           </property>
+                           <widget class="QWidget" name="widget_scrollarea_without_cover">
+                               <property name="geometry">
+                                   <rect>
+                                       <x>0</x>
+                                       <y>0</y>
+                                       <width>654</width>
+                                       <height>438</height>
+                                   </rect>
+                               </property>
+                               <layout class="QVBoxLayout" name="layout_without_cover"/>
+                           </widget>
+                       </widget>
+                   </item>
+               </layout>
            </widget>
            <widget class="QWidget" name="tab_with_errors">
                <attribute name="title">
                    <string>errors</string>
                </attribute>
-               <layout class="QVBoxLayout" name="verticalLayout_4"/>
+               <layout class="QVBoxLayout" name="verticalLayout_4">
+                   <item>
+                       <widget class="QScrollArea" name="scrollarea_with_errors">
+                           <property name="widgetResizable">
+                               <bool>true</bool>
+                           </property>
+                           <widget class="QWidget" name="widget_scrollarea_with_errors">
+                               <property name="geometry">
+                                   <rect>
+                                       <x>0</x>
+                                       <y>0</y>
+                                       <width>654</width>
+                                       <height>438</height>
+                                   </rect>
+                               </property>
+                               <layout class="QVBoxLayout" name="layout_with_errors"/>
+                           </widget>
+                       </widget>
+                   </item>
+               </layout>
            </widget>
     </widget>
    </item>
@@ -198,22 +174,5 @@
   </layout>
  </widget>
  <resources/>
-    <connections>
-        <connection>
-            <sender>groupBox</sender>
-            <signal>toggled(bool)</signal>
-            <receiver>widget</receiver>
-            <slot>setVisible(bool)</slot>
-            <hints>
-                <hint type="sourcelabel">
-                    <x>347</x>
-                    <y>325</y>
-                </hint>
-                <hint type="destinationlabel">
-                    <x>351</x>
-                    <y>332</y>
-                </hint>
-            </hints>
-        </connection>
-    </connections>
+    <connections/>
 </ui>

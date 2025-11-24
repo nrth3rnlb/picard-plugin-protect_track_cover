@@ -1,4 +1,3 @@
-# python
 # -*- coding: utf-8 -*-
 
 """
@@ -9,11 +8,14 @@ and there is a potential risk of these being replaced by the album cover.
 
 from __future__ import annotations
 
-import base64
 import os
+from collections.abc import Callable
+from functools import partial
 from typing import Any, List
 
 from PyQt5 import uic
+from PyQt5.QtCore import QObject, pyqtSignal
+from PyQt5.QtWidgets import QLayout
 
 PLUGIN_NAME = "Protect Track Cover"
 PLUGIN_AUTHOR = "nrth3rnlb"
@@ -28,23 +30,13 @@ PLUGIN_API_VERSIONS = ["2.0"]
 PLUGIN_LICENSE = "GPL-2.0"
 PLUGIN_LICENSE_URL = "https://www.gnu.org/licenses/gpl-2.0.html"
 
-MUSICBRAINZ_ALBUMID = "musicbrainz_albumid"
-
 import hashlib
 import traceback as _traceback
 
 from typing import Dict
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QWidget, QSizePolicy
 from PyQt5.QtCore import QTimer
 from PyQt5.QtWidgets import QVBoxLayout, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QGroupBox
-from PyQt5.QtGui import QPixmap
-
-try:
-    from PIL import Image, UnidentifiedImageError
-
-    PIL_AVAILABLE = True
-except ImportError:
-    PIL_AVAILABLE = False
 
 from typing import Set
 
@@ -65,12 +57,14 @@ _HASH_ERROR = "error"
 THUMBNAIL_MAX_SIZE = 100
 IMAGE_MAX_DIMENSION = 4096
 MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024
+MAX_VISIBLE_ROWS = 10
+DEFAULT_ROW_HEIGHT = 24
+ROW_PADDING = 4
+UI_NO_CONTENT_MESSAGE = "Nothing to show."
 
-_THUMBNAIL_UNAVAILABLE_HTML = ('<div style="color: gray; font-style: italic;">Image invalid or too large for '
-                               'preview.</div>')
-_THUMBNAIL_PIL_MISSING_HTML = '<div style="color: gray; font-style: italic;">Python Image Library is missing.</div>'
+MUSICBRAINZ_ALBUMID = "musicbrainz_albumid"
+
 # Global cache: per-album file hash cache
-# Structure: album_id -> { path -> {'hash':..., 'mtime':..., 'size':..., 'thumbnail_html':...} }
 album_file_hash_cache: Dict[str, Dict[str, Any]] = {}
 
 _pending_warn_albums: Set[str] = set()
@@ -102,12 +96,17 @@ def _is_cache_valid(cached: Dict[str, Any] | None, mtime: float | None, size: in
                     required_cache_key: str | None = None) -> bool:
     """
     Checks if the cached entry is valid based on mtime, size, and optional required key.
+    Make sure that `cached` is really a dict and return boolean.
     """
-    return (cached and mtime is not None and size is not None and
-            cached.get("mtime") == mtime and cached.get("size") == size and
-            (required_cache_key is None or (
-                    required_cache_key in cached and cached.get(required_cache_key) is not None)))
-
+    if not isinstance(cached, dict):
+        return False
+    if mtime is None or size is None:
+        return False
+    if cached.get("mtime") != mtime or cached.get("size") != size:
+        return False
+    if required_cache_key is None:
+        return True
+    return required_cache_key in cached and cached.get(required_cache_key) is not None
 
 def get_file_cover_hash(path: str, album_id: str | None = None) -> str | None:
     """
@@ -129,8 +128,9 @@ def get_file_cover_hash(path: str, album_id: str | None = None) -> str | None:
     # Update cache only if file stats are valid
     if mtime is not None:
         current = album_cache.get(path, {})
+        if not isinstance(current, dict):
+            current = {}
         if current.get("hash") != h:
-            # invalidate thumbnail_html
             current = {k: v for k, v in current.items() if k != "thumbnail_html"}
         album_cache[path] = {**current, "hash": h, "mtime": mtime, "size": size}
     return h
@@ -264,35 +264,101 @@ def format_scan_report(mapping):
             parts.append(f"- {len(paths)} files with read errors:")
         else:
             parts.append(f"- {len(paths)} files with cover hash {h}:")
-        for p in paths[:10]:
+        for p in paths[:MAX_VISIBLE_ROWS]:
             parts.append(f"    {os.path.basename(p)}")
-        if len(paths) > 10:
-            parts.append(f"    ... ({len(paths)-10} more)")
+        if len(paths) > MAX_VISIBLE_ROWS:
+            parts.append(f"    ... ({len(paths) - MAX_VISIBLE_ROWS} more)")
     return "\n".join(parts)
 
+class UIUpdater(QObject):
+    """
+    Small QObject that provides a thread-safe signal/slot bridge:
+    - request_update() can be called from any thread
+    - _on_update() runs in the GUI thread and creates/updates widgets
+    """
+    updateRequested = pyqtSignal(dict, 'QWidget')
+
+    def __init__(self, parent=None):
+        # Ensure parent is passed to QObject to manage lifetime
+        super().__init__(parent)
+        self.updateRequested.connect(self._on_update)
+
+    def request_update(self, filtered: dict, parent_widget=None) -> None:
+        # emit is thread-safe; the connected slot is executed in the GUI thread
+        try:
+            self.updateRequested.emit(filtered, parent_widget)
+        except Exception:
+            log.error("%s: Failed to emit updateRequested: %s", PLUGIN_NAME, _traceback.format_exc())
+
+    def _on_update(self, filtered: dict, parent_widget) -> None:
+        """
+        Slot, executed in the GUI thread: builds the GroupBoxes and updates the dialogue.
+        """
+        global all_albums_dialog
+        try:
+            with_cover, without_cover, errors = prepare_aggregated_report(filtered)
+
+            app = QApplication.instance()
+            created_app = False
+            if app is None:
+                app = QApplication([])
+                created_app = True
+
+            # Define a small handler that sets the module global to None when the dialog is destroyed.
+            def _on_dialog_destroyed(*_):
+                global all_albums_dialog
+                all_albums_dialog = None
+
+            if all_albums_dialog is None:
+                all_albums_dialog = AlbumsWarningDialog(parent_widget)
+                try:
+                    all_albums_dialog.destroyed.connect(_on_dialog_destroyed)
+                except Exception:
+                    pass
+
+            all_albums_dialog.update_dialog(with_cover, without_cover, errors)
+
+            if created_app:
+                # Temporarily created QApplication for headless operation; no further action required
+                pass
+
+        except Exception as e:
+            log.error("%s: UI update failed: %s", PLUGIN_NAME, e)
+            log.error("%s: Traceback: %s", PLUGIN_NAME, _traceback.format_exc())
 
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import QDialog, QStyle
 
+
 class AlbumsWarningDialog(QDialog):
+    """
+    Dialog to warn about albums with multiple different track covers.
+
+    Uses functools.partial for toggled handlers and stores handler references
+    so they can be disconnected when the layout is cleared. Child widgets
+    are queried with `findChildren()` each toggle to avoid stale references.
+    """
+
     def __init__(self, parent=None):
         super().__init__(parent)
-
         ui_file = os.path.join(os.path.dirname(__file__), 'albums_warning.ui')
         uic.loadUi(ui_file, self)
 
+        # storage for handler references keyed by id(groupbox)
+        self._groupbox_handlers: dict[int, Callable[[bool], None]] = {}
+
+        # Set dialog properties: non-modal and deleted on close
         self.setModal(False)
         self.setAttribute(Qt.WA_DeleteOnClose, True)
         self.closeButton.clicked.connect(self._on_close_clicked)
 
-        # try theme icon first, then fallback to platform standard icon
+        # Try theme icon first, then fall back to platform standard icon
         icon = QIcon.fromTheme("dialog-warning")
         if icon.isNull():
             icon = self.style().standardIcon(QStyle.SP_MessageBoxWarning)
 
-        # choose size (use label fixed size from UI)
         size = self.iconLabel.maximumSize()
         if size.width() <= 0 or size.height() <= 0:
             pixmap = icon.pixmap(48, 48)
@@ -301,24 +367,113 @@ class AlbumsWarningDialog(QDialog):
 
         self.iconLabel.setPixmap(pixmap)
         self.iconLabel.setScaledContents(False)
+        self.tabs.setCurrentIndex(0)
 
-    def update_dialog(self, with_cover: QGroupBox, without_cover: QGroupBox, with_errors: QGroupBox):
-        self.tab_with_cover.setLayout(QVBoxLayout())
-        self.tab_with_cover.layout().addWidget(with_cover)
-        self.tab_without_cover.setLayout(QVBoxLayout())
-        self.tab_without_cover.layout().addWidget(without_cover)
-        self.tab_with_errors.setLayout(QVBoxLayout())
-        self.tab_with_errors.layout().addWidget(with_errors)
+    def _clear_layout(self, layout: QLayout) -> None:
+        """Remove and delete all widgets from the given layout.
+        Disconnect any stored groupbox handlers before deleting the widgets.
+        """
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                # If this is a QGroupBox we may have a stored handler to disconnect.
+                try:
+                    if isinstance(widget, QGroupBox):
+                        handler = self._groupbox_handlers.pop(id(widget), None)
+                        if handler is not None:
+                            try:
+                                widget.toggled.disconnect(handler)
+                            except Exception:
+                                # ignore disconnect failures
+                                pass
+                except Exception:
+                    pass
+
+                widget.setParent(None)
+                widget.deleteLater()
+
+    def _toggle_children(self, box: QGroupBox, checked: bool) -> None:
+        """Toggle visibility of all descendant QWidget children of the given groupbox."""
+        try:
+            children = box.findChildren(QWidget)
+            for child in children:
+                try:
+                    child.setVisible(checked)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _add_groupboxes_to_layout(self, groupboxes: list[QGroupBox], target_layout: QLayout) -> None:
+        """
+        Add provided QGroupBox widgets to the target layout.
+        - Uses a single instance method `_toggle_children` with `partial` to avoid
+          per-iteration function definitions.
+        - Stores handler references so they can be disconnected on cleanup.
+        """
+        for box in groupboxes:
+            try:
+                box.setCheckable(True)
+                box.setChecked(True)
+            except Exception:
+                log.warning("%s: Failed setting GroupBox checkable state.", PLUGIN_NAME)
+
+            # Create a handler using partial(self._toggle_children, box)
+            try:
+                handler = partial(self._toggle_children, box)
+                box.toggled.connect(handler)
+                # remember handler so we can disconnect later
+                self._groupbox_handlers[id(box)] = handler
+            except Exception:
+                log.warning("%s: Failed connecting GroupBox toggled handler.", PLUGIN_NAME)
+
+            # Set initial visibility based on current checked state
+            try:
+                checked = box.isChecked()
+            except Exception:
+                checked = True
+
+            try:
+                for child in box.findChildren(QWidget):
+                    try:
+                        child.setVisible(checked)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            try:
+                target_layout.addWidget(box)
+            except Exception:
+                pass
+
+    def update_dialog(self, with_cover: list[QGroupBox], without_cover: list[QGroupBox], with_errors: list[QGroupBox]):
+        """
+        Refresh dialog contents:
+        - clear existing layouts (disconnect handlers first)
+        - insert new groupboxes and ensure their children are correctly shown/hidden
+        """
+        self._clear_layout(self.layout_with_cover)
+        self._clear_layout(self.layout_without_cover)
+        self._clear_layout(self.layout_with_errors)
+
+        self._add_groupboxes_to_layout(with_cover, self.layout_with_cover)
+        self._add_groupboxes_to_layout(without_cover, self.layout_without_cover)
+        self._add_groupboxes_to_layout(with_errors, self.layout_with_errors)
 
         try:
             self.show()
             self.raise_()
             self.activateWindow()
         except Exception:
+            # Silently ignore platform-specific activation issues
             pass
 
     def _on_close_clicked(self):
+        """Close the dialog when the close button is pressed."""
         self.close()
+
 
 def format_bytes(size: int) -> str:
     for unit in ['B', 'KB', 'MB', 'GB']:
@@ -326,66 +481,6 @@ def format_bytes(size: int) -> str:
             return f"{size:.0f} {unit}"
         size /= 1024.0
     return f"{size:.0f} TB"
-
-def _generate_thumbnail_html(img_data: bytes, album_id: str | None, idx: int) -> str:
-    """
-    Generate HTML for a thumbnail image or a fallback placeholder.
-    Validates, scales, and encodes the image data.
-    """
-    if not PIL_AVAILABLE:
-        return _THUMBNAIL_PIL_MISSING_HTML
-    from PIL import Image, UnidentifiedImageError
-    from io import BytesIO
-
-    if len(img_data) > MAX_IMAGE_SIZE_BYTES:
-        return (f'<div style="color: gray; font-style: italic;">Image data exceeds '
-                f'{format_bytes(MAX_IMAGE_SIZE_BYTES)} limit for preview.</div>')
-
-    img_io = BytesIO(img_data)
-    try:
-        img = Image.open(img_io)
-        if img.size[0] > IMAGE_MAX_DIMENSION or img.size[1] > IMAGE_MAX_DIMENSION:
-            img.close()
-            raise ValueError(f"Image dimensions exceed maximum of {IMAGE_MAX_DIMENSION} pixels.")
-        try:
-            # Always create a copy first for independence
-            final_img = img.copy()
-            # Robust transparency detection
-            has_transparency = (final_img.mode in ('RGBA', 'LA') or
-                                (final_img.mode == 'P' and 'transparency' in final_img.info))
-            try:
-                if final_img.mode not in ('RGB', 'RGBA'):
-                    new_img = final_img.convert('RGBA' if has_transparency else 'RGB')
-                    final_img.close()
-                    final_img = new_img
-                # Now final_img is independent and valid
-                final_img.thumbnail((THUMBNAIL_MAX_SIZE, THUMBNAIL_MAX_SIZE), Image.Resampling.LANCZOS)
-                output = BytesIO()
-                try:
-                    final_img.save(output, format='PNG')
-                    scaled_data = output.getvalue()
-                    img_b64 = base64.b64encode(scaled_data).decode('utf-8')
-                    return (f'<img src="data:image/png;base64,{img_b64}" alt="Cover preview" style="max-width:100px; '
-                            f'max-height:100px; margin:5px;">')
-                finally:
-                    output.close()
-            finally:
-                final_img.close()
-        finally:
-            img.close()
-    except UnidentifiedImageError:
-        log.error("%s: Unidentified image format in album %s, cover group %d", PLUGIN_NAME, album_id or "unknown album",
-                  idx)
-        return '<div style="color: gray; font-style: italic;">Invalid image format.</div>'
-    except ValueError as e:
-        log.error("%s: %s in album %s, cover group %d", PLUGIN_NAME, str(e), album_id or "unknown album", idx)
-        return '<div style="color: gray; font-style: italic;">Image dimensions too large.</div>'
-    except OSError:
-        log.error("%s: I/O error reading image in album %s, cover group %d", PLUGIN_NAME, album_id or "unknown album",
-                  idx)
-        return '<div style="color: gray; font-style: italic;">I/O error reading image.</div>'
-    finally:
-        img_io.close()
 
 def get_cached_thumbnail_data(path: str, album_id: str | None, idx: int) -> str | None:
     """
@@ -395,13 +490,15 @@ def get_cached_thumbnail_data(path: str, album_id: str | None, idx: int) -> str 
     cached = album_cache.get(path)
     mtime, size = _get_file_stat(path)
     if _is_cache_valid(cached, mtime, size, "thumbnail_data"):
-        return cached["thumbnail_data"]
+        if isinstance(cached, dict):
+            return cached.get("thumbnail_data")
+        return None
     # Not cached or outdated - generate new
     img_data = get_first_picture_bytes(path)
     h = get_file_cover_hash(path, album_id)
     if img_data:
         # Reuse thumbnail if hash is the same and thumbnail is cached
-        if cached and "thumbnail_data" in cached and cached.get("hash") == h:
+        if isinstance(cached, dict) and "thumbnail_data" in cached and cached.get("hash") == h:
             thumbnail_data = cached["thumbnail_data"]
         else:
             thumbnail_data = _generate_thumbnail_data(img_data, album_id, idx)
@@ -413,133 +510,272 @@ def get_cached_thumbnail_data(path: str, album_id: str | None, idx: int) -> str 
         update_dict = {"mtime": mtime, "size": size, "thumbnail_data": thumbnail_data}
         if h is not None:
             update_dict["hash"] = h
-        album_cache[path] = {**album_cache.get(path, {}), **update_dict}
+        existing = album_cache.get(path)
+        if not isinstance(existing, dict):
+            existing = {}
+        album_cache[path] = {**existing, **update_dict}
 
     return thumbnail_data
 
+from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtCore import QByteArray, QBuffer, QIODevice
+import base64
+
 def _generate_thumbnail_data(img_data: bytes, album_id: str | None, idx: int) -> str | None:
     """
-    Generate base64-encoded thumbnail data or return None.
+    Generate base64-encoded thumbnail data using Qt or return None.
     Validates, scales, and encodes the image data.
     """
-    if not PIL_AVAILABLE:
-        return None
-    from PIL import Image, UnidentifiedImageError
-    from io import BytesIO
-
     if len(img_data) > MAX_IMAGE_SIZE_BYTES:
         return None
 
-    img_io = BytesIO(img_data)
     try:
-        img = Image.open(img_io)
-        if img.size[0] > IMAGE_MAX_DIMENSION or img.size[1] > IMAGE_MAX_DIMENSION:
-            img.close()
-            raise ValueError(f"Image dimensions exceed maximum of {IMAGE_MAX_DIMENSION} pixels.")
-        try:
-            # Always create a copy first for independence
-            final_img = img.copy()
-            # Robust transparency detection
-            has_transparency = (final_img.mode in ('RGBA', 'LA') or
-                                (final_img.mode == 'P' and 'transparency' in final_img.info))
-            try:
-                if final_img.mode not in ('RGB', 'RGBA'):
-                    new_img = final_img.convert('RGBA' if has_transparency else 'RGB')
-                    final_img.close()
-                    final_img = new_img
-                # Now final_img is independent and valid
-                final_img.thumbnail((THUMBNAIL_MAX_SIZE, THUMBNAIL_MAX_SIZE), Image.Resampling.LANCZOS)
-                output = BytesIO()
-                try:
-                    final_img.save(output, format='PNG')
-                    scaled_data = output.getvalue()
-                    return base64.b64encode(scaled_data).decode('utf-8')
-                finally:
-                    output.close()
-            finally:
-                final_img.close()
-        finally:
-            img.close()
-    except (UnidentifiedImageError, ValueError, OSError):
-        log.error("%s: Error generating thumbnail data in album %s, cover group %d", PLUGIN_NAME,
-                  album_id or "unknown album", idx)
-        return None
-    finally:
-        img_io.close()
+        # Load image from bytes using QImage
+        image = QImage.fromData(img_data)
+        if image.isNull():
+            raise ValueError("Invalid image data")
 
-def prepare_aggregated_report(all_mappings: Dict[str, Dict]) -> tuple[QGroupBox, QGroupBox, QGroupBox]:
+        # Check dimensions
+        if image.width() > IMAGE_MAX_DIMENSION or image.height() > IMAGE_MAX_DIMENSION:
+            raise ValueError(f"Image dimensions exceed maximum of {IMAGE_MAX_DIMENSION} pixels.")
+
+        # Scale the image
+        scaled_image = image.scaled(THUMBNAIL_MAX_SIZE, THUMBNAIL_MAX_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+        # Save as PNG to QByteArray
+        byte_array = QByteArray()
+        buffer = QBuffer(byte_array)
+        buffer.open(QIODevice.WriteOnly)
+        if not scaled_image.save(buffer, "PNG"):
+            raise ValueError("Failed to save image as PNG")
+        buffer.close()
+
+        # Encode to base64
+        return base64.b64encode(byte_array.data()).decode('utf-8')
+
+    except (ValueError, Exception) as e:
+        log.error("%s: Error generating thumbnail data in album %s, cover group %d: %s", PLUGIN_NAME,
+                  album_id or "unknown album", idx, str(e))
+        return None
+
+def create_track_list(min_height: int = THUMBNAIL_MAX_SIZE) -> QListWidget:
+    """Creates a preconfigured QListWidget (minimum height, sorting)."""
+    lst = QListWidget()
+    lst.setSortingEnabled(True)
+    lst.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)  # Vertical only as high as necessary
+    lst.setMinimumHeight(min_height)  # at least as high as the thumbnail
+    return lst
+
+def adjust_list_height(lst: QListWidget, min_height: int = THUMBNAIL_MAX_SIZE,
+                       max_visible_rows: int = MAX_VISIBLE_ROWS) -> None:
+    """
+    Call after filling the list. Calculates the required height from the row heights
+    and sets the maximum/fixed height so that the list is only as large as necessary
+    (but at least `min_height`).
+    """
+    rows = lst.count()
+    if rows <= 0:
+        lst.setFixedHeight(min_height)
+        return
+
+    # Safely compute row height once (guard against widget/model errors)
+    row_h = min_height  # default fallback
+    try:
+        if lst.count() > 0:  # fresh check to avoid race condition
+            first_hint = lst.sizeHintForRow(0)
+            if first_hint > 0:
+                row_h = first_hint
+            else:
+                row_h = lst.sizeHintForIndex(lst.model().index(0, 0)).height()
+    except Exception:
+        # Use font metrics height as a more reasonable fallback for text-based lists
+        try:
+            row_h = lst.fontMetrics().height() + ROW_PADDING  # add small padding
+        except Exception:
+            row_h = DEFAULT_ROW_HEIGHT  # fixed fallback if font metrics fail
+        log.warning("%s: Failed to determine QListWidget row height, using font-based fallback.", PLUGIN_NAME)
+
+    frame = 2 * lst.frameWidth()
+    desired = row_h * rows + frame
+    # Minimum thumbnail size, maximum n visible rows (with scrollbar)
+    desired = max(desired, min_height)
+    desired = min(desired, row_h * max_visible_rows + frame)
+
+    lst.setFixedHeight(desired)
+
+def prepare_aggregated_report(all_mappings: Dict[str, Dict]) -> tuple[
+    list[QGroupBox], list[QGroupBox], list[QGroupBox]]:
+    """
+    Prepares the aggregated report as lists of QGroupBox widgets for:
+    - tracks with covers (grouped by hash)
+    - tracks without covers
+    - tracks with read errors
+    """
+    with_cover: list[QGroupBox] = []
+    without_cover: list[QGroupBox] = []
+    with_errors: list[QGroupBox] = []
+
     for album_id, entry in all_mappings.items():
         mapping = entry.get("mapping") if isinstance(entry, dict) and "mapping" in entry else entry
-        album_name = entry.get("name") if isinstance(entry, dict) else None
-
-        real_hashes = [k for k in mapping.keys() if k not in (None, _HASH_ERROR)]
-        distinct = set(real_hashes)
-        different_covers = len(distinct) > 1 or (len(distinct) == 1 and None in mapping)
-        if not different_covers:
+        if mapping is None or not isinstance(mapping, dict):
+            mapping = {}
+        if not get_different_covers(mapping):
             continue
 
-        any_shown = True
+        album_name = entry.get("name") if isinstance(entry, dict) else None
         album_label = album_name or album_id
 
-        # QGroupBox für jedes Album (einklappbar)
-        cover_list = QGroupBox(f"Album: {album_label}")
-        cover_list.setCheckable(True)
-        cover_list.setChecked(False)
-        album_layout = QVBoxLayout(cover_list)
+        # -- Group: tracks with covers (grouped by hash) --
+        groupbox_with_cover = QGroupBox(f"{album_label}")
+        layout_with_cover = QVBoxLayout(groupbox_with_cover)
+        layout_with_cover.setAlignment(Qt.AlignTop)
+        layout_with_cover.setSizeConstraint(QLayout.SetMinimumSize)
+        groupbox_with_cover.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        with_cover.append(groupbox_with_cover)
 
-        normal_groups = [(cover_hash, paths) for cover_hash, paths in mapping.items() if
-                         cover_hash not in (None, _HASH_ERROR)]
-        for idx, (h, paths) in enumerate(sorted(normal_groups, key=lambda x: -len(x[1])), start=1):
-            row_layout = QHBoxLayout()
+        cover_groups = [(cover_hash, paths) for cover_hash, paths in mapping.items()
+                        if cover_hash not in (None, _HASH_ERROR)]
 
-            # Thumbnail
-            thumbnail_label = QLabel()
-            thumbnail_data = get_cached_thumbnail_data(paths[0], album_id, idx)
-            if thumbnail_data:
-                pixmap = QPixmap()
-                pixmap.loadFromData(base64.b64decode(thumbnail_data))
-                if not pixmap.isNull():
-                    thumbnail_label.setPixmap(pixmap.scaled(100, 100, Qt.KeepAspectRatio))
-            row_layout.addWidget(thumbnail_label)
+        if not cover_groups:
+            layout_with_cover.addWidget(QLabel(UI_NO_CONTENT_MESSAGE))
+        else:
+            for idx, (h, paths) in enumerate(sorted(cover_groups, key=lambda x: -len(x[1])), start=1):
+                item_widget = QWidget()
+                hl = QHBoxLayout(item_widget)
+                hl.setAlignment(Qt.AlignTop)
+                item_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
 
-            # Liste der Dateinamen
-            list_widget = QListWidget()
-            for p in paths:
-                list_widget.addItem(QListWidgetItem(os.path.basename(p)))
-            row_layout.addWidget(list_widget)
+                # Thumbnail (feste Größe)
+                thumbnail_label = QLabel()
+                thumbnail_label.setAlignment(Qt.AlignTop)
+                thumbnail_label.setFixedSize(THUMBNAIL_MAX_SIZE, THUMBNAIL_MAX_SIZE)
+                thumbnail_data = get_cached_thumbnail_data(paths[0], album_id, idx)
+                if thumbnail_data:
+                    pixmap = QPixmap()
+                    pixmap.loadFromData(base64.b64decode(thumbnail_data))
+                    if not pixmap.isNull():
+                        thumbnail_label.setPixmap(
+                            pixmap.scaled(THUMBNAIL_MAX_SIZE, THUMBNAIL_MAX_SIZE, Qt.KeepAspectRatio,
+                                          Qt.SmoothTransformation))
+                hl.addWidget(thumbnail_label)
 
-            album_layout.addLayout(row_layout)
+                # Track list
+                track_list = create_track_list()
+                for p in paths:
+                    track_list.addItem(QListWidgetItem(os.path.basename(p)))
+                adjust_list_height(track_list)
+                hl.addWidget(track_list)
 
-        # No Cover
-        no_cover = mapping.get(None, [])
-        no_cover_list = QListWidget()
-        no_cover_list.addItem(QListWidgetItem(f"No embedded cover - {len(no_cover)} file(s):"))
-        if no_cover:
-            for p in no_cover:
-                no_cover_list.addItem(QListWidgetItem(os.path.basename(p)))
+                layout_with_cover.addWidget(item_widget)
 
-        # Errors
-        errors = mapping.get(_HASH_ERROR, [])
-        errors_list = QListWidget()
-        errors_list.addItem(QListWidgetItem(f"Read errors - {len(errors)} file(s):"))
-        if errors:
-            for p in errors:
-                errors_list.addItem(QListWidgetItem(os.path.basename(p)))
+        # -- Group: tracks without covers (list of paths) --
+        groupbox_without_cover = QGroupBox(f"{album_label}")
+        layout_without = QVBoxLayout(groupbox_without_cover)
+        layout_without.setAlignment(Qt.AlignTop)
+        layout_without.setSizeConstraint(QLayout.SetMinimumSize)
+        groupbox_without_cover.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        without_cover.append(groupbox_without_cover)
 
-    return cover_list, no_cover_list, errors_list
+        no_cover_paths = mapping.get(None, [])
+        if not no_cover_paths:
+            layout_without.addWidget(QLabel(UI_NO_CONTENT_MESSAGE))
+        else:
+            # Sort once for display
+            sorted_no_cover_paths = sorted(no_cover_paths)
+            item_widget = QWidget()
+            hl = QHBoxLayout(item_widget)
+            hl.setAlignment(Qt.AlignTop)
+            item_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+
+            track_list = create_track_list()
+            for p in sorted_no_cover_paths:
+                track_list.addItem(QListWidgetItem(os.path.basename(p)))
+            adjust_list_height(track_list)
+            hl.addWidget(track_list)
+
+            layout_without.addWidget(item_widget)
+
+        # -- Group: tracks with read errors --
+        groupbox_errors = QGroupBox(f"{album_label}")
+        layout_errors = QVBoxLayout(groupbox_errors)
+        layout_errors.setAlignment(Qt.AlignTop)
+        layout_errors.setSizeConstraint(QLayout.SetMinimumSize)
+        groupbox_errors.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        with_errors.append(groupbox_errors)
+
+        error_paths = mapping.get(_HASH_ERROR, [])
+        if not error_paths:
+            layout_errors.addWidget(QLabel(UI_NO_CONTENT_MESSAGE))
+        else:
+            # Sort once for display
+            sorted_error_paths = sorted(error_paths)
+            item_widget = QWidget()
+            hl = QHBoxLayout(item_widget)
+            hl.setAlignment(Qt.AlignTop)
+            item_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+
+            track_list = create_track_list()
+            for p in sorted_error_paths:
+                track_list.addItem(QListWidgetItem(os.path.basename(p)))
+            adjust_list_height(track_list)
+            hl.addWidget(track_list)
+
+            layout_errors.addWidget(item_widget)
+
+    return with_cover, without_cover, with_errors
+
+def get_different_covers(mapping: dict[Any, Any] | None = None) -> bool:
+    """
+    Determines if the mapping indicates multiple different covers.
+
+    Accepts an explicit mapping or None. Non-dict values are treated as empty mapping.
+    Returns True if there are different covers, False otherwise.
+    """
+    if mapping is None or not isinstance(mapping, dict):
+        mapping = {}
+
+    real_hashes = [k for k in mapping.keys() if k not in (None, _HASH_ERROR)]
+    distinct = set(real_hashes)
+    return len(distinct) > 1 or (len(distinct) == 1 and None in mapping)
+
+ui_updater: UIUpdater | None = None
+
+def get_ui_updater(parent_widget=None) -> UIUpdater:
+    """
+    Return the module-level UIUpdater instance, creating it if necessary.
+    Prefer to set QApplication.instance() (or the provided parent_widget if it is a QObject)
+    as the parent to ensure the updater is owned by the Qt object tree and not
+    garbage collected prematurely.
+    """
+    global ui_updater
+    if ui_updater is not None:
+        return ui_updater
+
+    parent = None
+    try:
+        # prefer a sensible QObject parent if available
+        if parent_widget is not None and isinstance(parent_widget, QObject):
+            parent = parent_widget
+        else:
+            app = QApplication.instance()
+            if app is not None:
+                parent = app
+    except Exception:
+        parent = None
+
+    # create and store the updater with chosen parent (may be None if no app yet)
+    ui_updater = UIUpdater(parent)
+    return ui_updater
 
 def warn_if_multiple_covers(mapping, parent_widget=None, album_id: str | None = None, album_name: str | None = None):
     """
     Non-blocking aggregated warning for all albums.
-    - Updates internal per-album mapping and stored album name.
-    - Maintains a single dialog for all albums
+    Now delegates UI creation to ui_updater to ensure all widget work is on the GUI thread.
     """
     global all_albums_dialog, all_album_mappings, album_dialog_closed
 
     # compute whether this album has multiple covers
-    real_hashes = [k for k in mapping.keys() if k not in (None, _HASH_ERROR)]
-    distinct = set(real_hashes)
-    different_covers = len(distinct) > 1 or (len(distinct) == 1 and None in mapping)
+    different_covers = get_different_covers(mapping)
 
     # update aggregated state for this album_id (store mapping + name)
     if album_id:
@@ -560,49 +796,25 @@ def warn_if_multiple_covers(mapping, parent_widget=None, album_id: str | None = 
                     all_albums_dialog.close()
                 except Exception:
                     pass
-                globals().update({'all_albums_dialog': None})
+                # direct assignment instead of globals().update(...)
+                all_albums_dialog = None
         except Exception:
             pass
         return True
 
-    # Build aggregated HTML only for albums_to_show
+    # Build filtered data only (no widgets!) and delegate UI work to ui_updater
     filtered = {aid: all_album_mappings[aid] for aid in albums_to_show}
-    with_cover, without_cover, errors = prepare_aggregated_report(filtered)
-
-    app = QApplication.instance()
-    created_app = False
-    if app is None:
-        app = QApplication([])
-        created_app = True
-
-    try:
-        if all_albums_dialog is None:
-            all_albums_dialog = AlbumsWarningDialog(parent_widget)
-            # ensure deletion from variable when window is destroyed
-            try:
-                all_albums_dialog.destroyed.connect(lambda _: globals().update({'all_albums_dialog': None}))
-            except Exception:
-                pass
-        all_albums_dialog.update_dialog(with_cover, without_cover, errors)
-    except Exception as e:
-        log.error("%s: Failed updating/creating aggregated dialog: %s", PLUGIN_NAME, e)
-        log.error("%s: Traceback: %s", PLUGIN_NAME, _traceback.format_exc())
-
-    if created_app:
-        # do not quit the app because Picard manages the main loop;
-        # app was created only to allow widget creation in tests/environments.
-        pass
-
+    # use get_ui_updater to ensure proper parent/lifetime
+    get_ui_updater(parent_widget).request_update(filtered, parent_widget)
     return True
 
 def get_albums_to_show(dialog_closed: set[str], album_mappings: dict[str, dict[str, Any]]) -> list[str]:
     albums_to_show = []
     for aid, entry in album_mappings.items():
-        m = entry.get('mapping') if isinstance(entry, dict) and 'mapping' in entry else entry
-        real_hashes = [k for k in m.keys() if k not in (None, _HASH_ERROR)]
-        distinct = set(real_hashes)
-        diff = len(distinct) > 1 or (len(distinct) == 1 and None in m)
-        if diff and aid not in dialog_closed:
+        mapping = entry.get('mapping') if isinstance(entry, dict) and 'mapping' in entry else entry
+        if mapping is None or not isinstance(mapping, dict):
+            mapping = {}
+        if get_different_covers(mapping) and aid not in dialog_closed:
             albums_to_show.append(aid)
     return albums_to_show
 
@@ -660,6 +872,8 @@ def protect_track_cover(track, file: Any):
 
 
 def on_album_removed(album: Any):
+    """Handles cleanup when an album is removed from the library."""
+    global all_albums_dialog
     try:
         # determine album id robustly
         album_id = None
@@ -702,13 +916,17 @@ def on_album_removed(album: Any):
                         all_albums_dialog.close()
                     except Exception:
                         pass
-                    globals().update({'all_albums_dialog': None})
+                    # direct assignment instead of globals().update(...)
+                    all_albums_dialog = None
             else:
-                # refresh dialog contents for remaining albums
+                # build filtered data and delegate UI work to the UIUpdater (GUI thread)
                 filtered = {aid: all_album_mappings[aid] for aid in albums_to_show}
-                if all_albums_dialog is not None:
-                    with_cover, without_cover, errors = prepare_aggregated_report(filtered)
-                    all_albums_dialog.update_dialog(with_cover, without_cover, errors)
+                try:
+                    # parent unknown here; pass None (UIUpdater will prefer QApplication.instance() as parent)
+                    get_ui_updater(None).request_update(filtered, None)
+                except Exception:
+                    log.error("%s: Failed to request UI update after album removal: %s", PLUGIN_NAME,
+                              _traceback.format_exc())
         except Exception:
             log.error("%s: Error updating dialog after album removal: %s", PLUGIN_NAME, _traceback.format_exc())
 
