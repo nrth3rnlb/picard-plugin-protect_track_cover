@@ -63,20 +63,31 @@
     </layout>
    </item>
    <item>
-       <widget class="QTabWidget" name="tabWidget">
+       <widget class="QTabWidget" name="tabs">
+           <property name="currentIndex">
+               <number>0</number>
+           </property>
            <widget class="QWidget" name="tab_with_cover">
                <attribute name="title">
                    <string>with a cover</string>
                </attribute>
                <layout class="QVBoxLayout" name="verticalLayout_2">
                    <item>
-                       <widget class="QTextBrowser" name="browser">
-                           <property name="readOnly">
+                       <widget class="QScrollArea" name="scrollarea_with_cover">
+                           <property name="widgetResizable">
                                <bool>true</bool>
                            </property>
-                           <property name="openExternalLinks">
-                               <bool>false</bool>
-                           </property>
+                           <widget class="QWidget" name="widget_scrollarea_with_cover">
+                               <property name="geometry">
+                                   <rect>
+                                       <x>0</x>
+                                       <y>0</y>
+                                       <width>654</width>
+                                       <height>438</height>
+                                   </rect>
+                               </property>
+                               <layout class="QVBoxLayout" name="layout_with_cover"/>
+                           </widget>
                        </widget>
                    </item>
                </layout>
@@ -87,30 +98,46 @@
                </attribute>
                <layout class="QVBoxLayout" name="verticalLayout_3">
                    <item>
-                       <widget class="QTextBrowser" name="browser_no_cover">
-                           <property name="readOnly">
+                       <widget class="QScrollArea" name="scrollarea_without_cover">
+                           <property name="widgetResizable">
                                <bool>true</bool>
                            </property>
-                           <property name="openExternalLinks">
-                               <bool>false</bool>
-                           </property>
+                           <widget class="QWidget" name="widget_scrollarea_without_cover">
+                               <property name="geometry">
+                                   <rect>
+                                       <x>0</x>
+                                       <y>0</y>
+                                       <width>654</width>
+                                       <height>438</height>
+                                   </rect>
+                               </property>
+                               <layout class="QVBoxLayout" name="layout_without_cover"/>
+                           </widget>
                        </widget>
                    </item>
                </layout>
            </widget>
-           <widget class="QWidget" name="tab_errors">
+           <widget class="QWidget" name="tab_with_errors">
                <attribute name="title">
                    <string>errors</string>
                </attribute>
                <layout class="QVBoxLayout" name="verticalLayout_4">
                    <item>
-                       <widget class="QTextBrowser" name="browser_errors">
-                           <property name="readOnly">
+                       <widget class="QScrollArea" name="scrollarea_with_errors">
+                           <property name="widgetResizable">
                                <bool>true</bool>
                            </property>
-                           <property name="openExternalLinks">
-                               <bool>false</bool>
-                           </property>
+                           <widget class="QWidget" name="widget_scrollarea_with_errors">
+                               <property name="geometry">
+                                   <rect>
+                                       <x>0</x>
+                                       <y>0</y>
+                                       <width>654</width>
+                                       <height>438</height>
+                                   </rect>
+                               </property>
+                               <layout class="QVBoxLayout" name="layout_with_errors"/>
+                           </widget>
                        </widget>
                    </item>
                </layout>
@@ -147,5 +174,5 @@
   </layout>
  </widget>
  <resources/>
- <connections/>
+    <connections/>
 </ui>
